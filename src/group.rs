@@ -71,9 +71,6 @@ pub fn register_classes(instance: HINSTANCE) {
 }
 
 impl GroupWindows {
-    /// An owned group sits above the desktop view: the body is a translucent backdrop that takes the
-    /// input, and a click-through color-keyed glass on top of it shows the icons. Otherwise the body is a
-    /// backdrop below Explorer's own icons.
     pub fn create(
         index: usize, group: &Group, host: HWND, def_view: HWND, instance: HINSTANCE, owned: bool,
     ) -> Result<GroupWindows> {

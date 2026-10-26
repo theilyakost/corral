@@ -35,9 +35,6 @@ use windows::core::{Result, w};
 
 use crate::shell::{self, MenuChoice};
 
-// The glass is color-keyed, not alpha-blended: per-pixel alpha (UpdateLayeredWindow) does not show up on a
-// child of Explorer's desktop window. Everything drawn on it is opaque and antialiased against the dark key,
-// which reads as a faint shadow over the translucent backdrop below.
 pub const GLASS_KEY: COLORREF = COLORREF(0x0002_0103);
 const KEY_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 3.0 / 255.0, g: 1.0 / 255.0, b: 2.0 / 255.0, a: 1.0 };
 const HOVER_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.2, g: 0.21, b: 0.22, a: 1.0 };
@@ -45,14 +42,14 @@ const SELECTED_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.3, g: 0.32, b: 0.35, a:
 const TEXT_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 const SHADOW_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.75 };
 
-const CELL_WIDTH: f32 = 86.0;
+const CELL_WIDTH: f32 = 76.0;
 const CELL_HEIGHT: f32 = 96.0;
 const ICON_SIZE: f32 = 48.0;
 const ICON_TOP: f32 = 6.0;
 const LABEL_GAP: f32 = 4.0;
 const LABEL_LINES: f32 = 2.0;
 const FONT_SIZE: f32 = 12.0;
-const PADDING: f32 = 6.0;
+const PADDING: f32 = 4.0;
 
 pub struct Entry {
     name: String,
@@ -80,7 +77,7 @@ struct Graphics {
 struct Metrics {
     scale: f32,
     columns: usize,
-    left: f32,
+    cell_width: f32,
 }
 
 thread_local! {
@@ -96,8 +93,6 @@ pub fn register(body: HWND, glass: HWND) {
     SHELVES.with(|cell| _ = cell.borrow_mut().insert(body.0 as isize, Shelf { glass, ..Default::default() }));
 }
 
-// Shell calls can pump messages, so they never run while SHELVES is borrowed: a glass repainting
-// in the middle would find its shelf busy and come out empty.
 pub fn set_items(hwnd: HWND, items: Vec<(String, IShellItem)>) {
     let Some(known) = with_shelf(hwnd, |shelf| shelf.entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>())
     else {
@@ -139,17 +134,17 @@ fn load_icons(body: HWND, pixels: i32) {
 fn metrics(hwnd: HWND, width: f32) -> Metrics {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
-    let cell = CELL_WIDTH * scale;
-    let columns = (((width - 2.0 * PADDING * scale) / cell).floor() as usize).max(1);
-    let left = ((width - columns as f32 * cell) / 2.0).max(0.0);
-    Metrics { scale, columns, left }
+    let inner = (width - 2.0 * PADDING * scale).max(0.0);
+    let columns = ((inner / (CELL_WIDTH * scale)).floor() as usize).max(1);
+    let cell_width = (inner / columns as f32).max(CELL_WIDTH * scale);
+    Metrics { scale, columns, cell_width }
 }
 
 impl Metrics {
     fn cell(&self, index: usize, scroll: f32) -> D2D_RECT_F {
         let (col, row) = ((index % self.columns) as f32, (index / self.columns) as f32);
-        let (w, h) = (CELL_WIDTH * self.scale, CELL_HEIGHT * self.scale);
-        let left = self.left + col * w;
+        let (w, h) = (self.cell_width, CELL_HEIGHT * self.scale);
+        let left = PADDING * self.scale + col * w;
         let top = PADDING * self.scale + row * h - scroll;
         D2D_RECT_F { left, top, right: left + w, bottom: top + h }
     }
@@ -247,7 +242,6 @@ fn paint_glass(glass: HWND, hdc: HDC) {
     }
 }
 
-/// Returns false when the shelf was busy and the glass needs another paint.
 fn draw(body: HWND, glass: HWND, hdc: HDC) -> Result<bool> {
     let (width, height) = client_size(glass);
     if width <= 0 || height <= 0 {
