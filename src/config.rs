@@ -18,12 +18,50 @@ pub struct Group {
     pub height: i32,
     #[serde(default)]
     pub rules: Vec<String>,
+    #[serde(default)]
+    pub items: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 impl Group {
     pub fn matches(&self, file_name: &str) -> bool {
         self.rules.iter().any(|rule| glob_match(rule, file_name))
     }
+
+    pub fn empty() -> Group {
+        Group {
+            name: String::new(),
+            x: 0,
+            y: 0,
+            width: 420,
+            height: 260,
+            rules: Vec::new(),
+            items: Vec::new(),
+            exclude: Vec::new(),
+            collapsed: false,
+        }
+    }
+
+    fn holds(&self, file_name: &str) -> bool {
+        contains(&self.items, file_name)
+    }
+
+    fn rejects(&self, file_name: &str) -> bool {
+        contains(&self.exclude, file_name)
+    }
+}
+
+fn contains(list: &[String], name: &str) -> bool {
+    let name = name.to_lowercase();
+    list.iter().any(|n| n.to_lowercase() == name)
+}
+
+fn remove(list: &mut Vec<String>, name: &str) {
+    let name = name.to_lowercase();
+    list.retain(|n| n.to_lowercase() != name);
 }
 
 impl Config {
@@ -56,6 +94,30 @@ impl Config {
         fs::rename(&tmp, &path)
     }
 
+    pub fn group_of(&self, file_name: &str) -> Option<usize> {
+        self.groups
+            .iter()
+            .position(|g| g.holds(file_name))
+            .or_else(|| self.groups.iter().position(|g| g.matches(file_name) && !g.rejects(file_name)))
+    }
+
+    pub fn put(&mut self, index: usize, file_name: &str) {
+        for group in &mut self.groups {
+            remove(&mut group.items, file_name);
+        }
+        let Some(group) = self.groups.get_mut(index) else { return };
+        remove(&mut group.exclude, file_name);
+        group.items.push(file_name.to_string());
+    }
+
+    pub fn take_out(&mut self, index: usize, file_name: &str) {
+        let Some(group) = self.groups.get_mut(index) else { return };
+        remove(&mut group.items, file_name);
+        if group.matches(file_name) && !group.rejects(file_name) {
+            group.exclude.push(file_name.to_string());
+        }
+    }
+
     fn starter() -> Config {
         Config {
             groups: vec![
@@ -66,6 +128,7 @@ impl Config {
                     width: 420,
                     height: 260,
                     rules: vec!["*.txt".into(), "*.pdf".into(), "*.doc*".into(), "*.xls*".into(), "*.md".into()],
+                    ..Group::empty()
                 },
                 Group {
                     name: "Картинки".into(),
@@ -74,6 +137,7 @@ impl Config {
                     width: 420,
                     height: 260,
                     rules: vec!["*.png".into(), "*.jpg".into(), "*.jpeg".into(), "*.gif".into(), "*.webp".into()],
+                    ..Group::empty()
                 },
             ],
         }
@@ -115,6 +179,28 @@ mod tests {
         assert!(glob_match("*", "anything"));
         assert!(!glob_match("*.txt", "notes.txt.lnk"));
         assert!(!glob_match("img_??.png", "img_1.png"));
+    }
+
+    #[test]
+    fn membership() {
+        let mut config = Config::starter();
+        assert_eq!(config.group_of("a.TXT"), Some(0));
+        assert_eq!(config.group_of("app.exe"), None);
+
+        config.put(1, "a.txt");
+        assert_eq!(config.group_of("a.txt"), Some(1));
+        config.put(0, "a.txt");
+        assert_eq!(config.group_of("a.txt"), Some(0));
+
+        config.take_out(0, "a.txt");
+        assert_eq!(config.group_of("a.txt"), None);
+        config.put(0, "a.txt");
+        assert_eq!(config.group_of("a.txt"), Some(0));
+
+        config.put(0, "Тест.exe");
+        assert_eq!(config.group_of("тест.EXE"), Some(0));
+        config.take_out(0, "тест.exe");
+        assert_eq!(config.group_of("Тест.exe"), None);
     }
 
     #[test]

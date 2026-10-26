@@ -4,16 +4,24 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+corral-agent = { path = "agent" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 windows = { version = "0.61.1", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -24,3 +32,4 @@ windows = { version = "0.61.1", features = [
 
 [workspace]
 members = ["agent"]
+default-members = [".", "agent"]

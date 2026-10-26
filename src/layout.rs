@@ -140,6 +140,7 @@ mod tests {
             width: 400,
             height: 300,
             rules: rules.iter().map(|r| r.to_string()).collect(),
+            ..Group::empty()
         }
     }
 

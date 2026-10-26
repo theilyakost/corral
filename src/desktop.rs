@@ -6,7 +6,8 @@ use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, I
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Shell::Common::{ITEMIDLIST, STRRET};
 use windows::Win32::UI::Shell::{
-    CSIDL_DESKTOP, FWF_AUTOARRANGE, IFolderView2, IShellBrowser, IShellFolder, IShellWindows, SHGDN_FORPARSING,
+    CSIDL_DESKTOP, FWF_AUTOARRANGE, IFolderView2, IShellBrowser, IShellFolder, IShellItem, IShellWindows,
+    SHCreateItemWithParent, SHGDN_FORPARSING,
     SHGDN_INFOLDER, SHGDNF, SID_STopLevelBrowser, SVGIO_ALLVIEW, SVSI_POSITIONITEM, SWC_DESKTOP,
     SWFO_NEEDDISPATCH, ShellWindows, StrRetToStrW,
 };
@@ -51,6 +52,14 @@ impl Desktop {
             let host = GetParent(def_view)?;
             Ok(Desktop { view, folder, host, def_view, list_view })
         }
+    }
+
+    pub fn list_view(&self) -> HWND {
+        self.list_view
+    }
+
+    pub fn shell_item(&self, item: &DesktopItem) -> Result<IShellItem> {
+        unsafe { SHCreateItemWithParent(None, &self.folder, item.pidl) }
     }
 
     pub fn disable_auto_arrange(&self) -> Result<()> {

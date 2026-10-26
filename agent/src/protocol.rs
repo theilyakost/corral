@@ -3,6 +3,7 @@ pub const HOOK_PROC: &[u8] = b"corral_hook_proc\0";
 
 pub const CMD_SET_HIDDEN: usize = 1;
 pub const CMD_DETACH: usize = 2;
+pub const CMD_SET_OWNER: usize = 3;
 
 pub fn encode_names<S: AsRef<str>>(names: &[S]) -> Vec<u16> {
     let mut out = Vec::new();

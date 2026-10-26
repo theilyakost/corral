@@ -4,18 +4,22 @@ use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows::Win32::Foundation::{FreeLibrary, HMODULE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, FreeLibrary, HANDLE, HMODULE, HWND, LPARAM, LRESULT, POINT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, IServiceProvider};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::{
     FreeLibraryAndExitThread, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleHandleExW,
 };
-use windows::Win32::System::Threading::{CreateThread, GetCurrentThreadId, THREAD_CREATION_FLAGS};
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateThread, GetCurrentThreadId, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
+    THREAD_CREATION_FLAGS, WaitForMultipleObjects, WaitForSingleObject,
+};
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Controls::{
-    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_NOTIFYITEMDRAW, CDRF_SKIPDEFAULT, LVHITTESTINFO, LVM_HITTEST,
-    NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_NOTIFYITEMDRAW, CDRF_SKIPDEFAULT, LVHITTESTINFO, LVIF_STATE,
+    LVIS_SELECTED, LVITEMW, LVM_GETITEMCOUNT, LVM_HITTEST, LVM_SETITEMSTATE, LVN_ITEMCHANGED, LVN_ITEMCHANGING,
+    NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMLISTVIEW,
 };
 use windows::Win32::UI::Shell::Common::STRRET;
 use windows::Win32::UI::Shell::{
@@ -25,19 +29,26 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, FindWindowW,
-    GetWindowThreadProcessId, HWND_MESSAGE, RegisterClassW, SendMessageW, UnregisterClassW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_COPYDATA, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NOTIFY, WM_RBUTTONDOWN,
+    GetWindowThreadProcessId, HWND_MESSAGE, PostMessageW, RegisterClassW, SendMessageW, UnregisterClassW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_COPYDATA, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NOTIFY, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WNDCLASSW,
 };
 use windows::core::{HSTRING, Interface, PCWSTR, PWSTR, Result, w};
 
-use crate::protocol::{self, CMD_DETACH, CMD_SET_HIDDEN};
+use crate::protocol::{self, CMD_DETACH, CMD_SET_HIDDEN, CMD_SET_OWNER};
 
 const SUBCLASS_ID: usize = 0xC0AA;
+const WM_OWNER_GONE: u32 = WM_APP + 1;
 
 struct ThreadBound<T>(T);
 
 unsafe impl<T> Sync for ThreadBound<T> {}
+
+struct OwnerWatch {
+    process: HANDLE,
+    stop: HANDLE,
+    window: HWND,
+}
 
 struct State {
     module: HMODULE,
@@ -47,6 +58,12 @@ struct State {
     view: IFolderView2,
     folder: IShellFolder,
     hidden: HashSet<String>,
+    watch: Option<(HANDLE, *mut OwnerWatch)>,
+}
+
+struct Unload {
+    module: HMODULE,
+    watch: Option<(HANDLE, *mut OwnerWatch)>,
 }
 
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -89,7 +106,7 @@ unsafe fn attach() -> Result<()> {
                 WINDOW_EX_STYLE::default(), &class_name, None, WINDOW_STYLE::default(),
                 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(module.into()), None,
             )?;
-            Ok(State { module, def_view, list_view, window, view, folder, hidden: HashSet::new() })
+            Ok(State { module, def_view, list_view, window, view, folder, hidden: HashSet::new(), watch: None })
         };
         let state = match setup() {
             Ok(state) => state,
@@ -152,7 +169,7 @@ unsafe extern "system" fn def_view_proc(
     hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize,
 ) -> LRESULT {
     if msg == WM_NOTIFY {
-        let handled = catch_unwind(AssertUnwindSafe(|| unsafe { custom_draw(hwnd, msg, wparam, lparam) }));
+        let handled = catch_unwind(AssertUnwindSafe(|| unsafe { notify(hwnd, msg, wparam, lparam) }));
         if let Ok(Some(result)) = handled {
             return result;
         }
@@ -160,21 +177,58 @@ unsafe extern "system" fn def_view_proc(
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
-unsafe fn custom_draw(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+unsafe fn notify(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     unsafe {
         let header = &*(lparam.0 as *const NMHDR);
-        if header.code != NM_CUSTOMDRAW || Some(header.hwndFrom) != list_view() {
+        let list_view = list_view()?;
+        if header.hwndFrom != list_view {
             return None;
         }
-        let draw = &*(lparam.0 as *const NMCUSTOMDRAW);
-        if draw.dwDrawStage == CDDS_PREPAINT {
-            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
-            return Some(LRESULT(result.0 | CDRF_NOTIFYITEMDRAW as isize));
+        match header.code {
+            NM_CUSTOMDRAW => {
+                let draw = &*(lparam.0 as *const NMCUSTOMDRAW);
+                if draw.dwDrawStage == CDDS_PREPAINT {
+                    let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                    return Some(LRESULT(result.0 | CDRF_NOTIFYITEMDRAW as isize));
+                }
+                if draw.dwDrawStage == CDDS_ITEMPREPAINT && is_hidden(draw.dwItemSpec) {
+                    return Some(LRESULT(CDRF_SKIPDEFAULT as isize));
+                }
+                None
+            }
+            LVN_ITEMCHANGING => {
+                let change = &*(lparam.0 as *const NMLISTVIEW);
+                let selecting = (change.uChanged.0 & LVIF_STATE.0) != 0
+                    && (change.uNewState & LVIS_SELECTED.0) != 0
+                    && (change.uOldState & LVIS_SELECTED.0) == 0;
+                if selecting && change.iItem >= 0 && is_hidden(change.iItem as usize) {
+                    return Some(LRESULT(1));
+                }
+                None
+            }
+            LVN_ITEMCHANGED => {
+                let change = &*(lparam.0 as *const NMLISTVIEW);
+                if change.iItem < 0 && (change.uNewState & LVIS_SELECTED.0) != 0 {
+                    let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                    deselect_hidden(list_view);
+                    return Some(result);
+                }
+                None
+            }
+            _ => None,
         }
-        if draw.dwDrawStage == CDDS_ITEMPREPAINT && is_hidden(draw.dwItemSpec) {
-            return Some(LRESULT(CDRF_SKIPDEFAULT as isize));
+    }
+}
+
+unsafe fn deselect_hidden(list_view: HWND) {
+    unsafe {
+        let count = SendMessageW(list_view, LVM_GETITEMCOUNT, None, None).0;
+        for index in 0..count.max(0) as usize {
+            if is_hidden(index) {
+                let item = LVITEMW { stateMask: LVIS_SELECTED, ..Default::default() };
+                SendMessageW(list_view, LVM_SETITEMSTATE, Some(WPARAM(index)), Some(LPARAM(&item as *const _ as isize)));
+            }
         }
-        None
     }
 }
 
@@ -199,21 +253,27 @@ unsafe fn hits_hidden(hwnd: HWND, lparam: LPARAM) -> bool {
 }
 
 unsafe extern "system" fn agent_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if msg == WM_COPYDATA {
-        let handled = catch_unwind(AssertUnwindSafe(|| unsafe { command(&*(lparam.0 as *const COPYDATASTRUCT)) }));
-        return LRESULT(handled.is_ok() as isize);
+    match msg {
+        WM_COPYDATA => {
+            let handled = catch_unwind(AssertUnwindSafe(|| unsafe { command(&*(lparam.0 as *const COPYDATASTRUCT)) }));
+            LRESULT(handled.is_ok() as isize)
+        }
+        WM_OWNER_GONE => {
+            _ = catch_unwind(|| unsafe { detach() });
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 unsafe fn command(data: &COPYDATASTRUCT) {
+    let words = if data.lpData.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(data.lpData as *const u16, data.cbData as usize / 2) }
+    };
     match data.dwData {
         CMD_SET_HIDDEN => {
-            let words = if data.lpData.is_null() {
-                &[][..]
-            } else {
-                unsafe { std::slice::from_raw_parts(data.lpData as *const u16, data.cbData as usize / 2) }
-            };
             let names = protocol::decode_names(words);
             let list_view = {
                 let Ok(mut state) = STATE.0.try_borrow_mut() else { return };
@@ -221,11 +281,52 @@ unsafe fn command(data: &COPYDATASTRUCT) {
                 state.hidden = names.into_iter().map(|n| n.to_lowercase()).collect();
                 state.list_view
             };
-            unsafe { _ = InvalidateRect(Some(list_view), None, true) };
+            unsafe {
+                deselect_hidden(list_view);
+                _ = InvalidateRect(Some(list_view), None, true);
+            }
+        }
+        CMD_SET_OWNER if words.len() >= 2 => {
+            let pid = words[0] as u32 | (words[1] as u32) << 16;
+            unsafe { watch_owner(pid) };
         }
         CMD_DETACH => unsafe { detach() },
         _ => {}
     }
+}
+
+unsafe fn watch_owner(pid: u32) {
+    let Ok(mut state) = STATE.0.try_borrow_mut() else { return };
+    let Some(state) = state.as_mut() else { return };
+    if state.watch.is_some() {
+        return;
+    }
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else { return };
+        let Ok(stop) = CreateEventW(None, true, false, None) else {
+            _ = CloseHandle(process);
+            return;
+        };
+        let context = Box::into_raw(Box::new(OwnerWatch { process, stop, window: state.window }));
+        match CreateThread(None, 0, Some(owner_thread), Some(context as *const c_void), THREAD_CREATION_FLAGS(0), None) {
+            Ok(thread) => state.watch = Some((thread, context)),
+            Err(_) => {
+                let context = Box::from_raw(context);
+                _ = CloseHandle(context.process);
+                _ = CloseHandle(context.stop);
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn owner_thread(context: *mut c_void) -> u32 {
+    unsafe {
+        let context = &*(context as *const OwnerWatch);
+        if WaitForMultipleObjects(&[context.process, context.stop], false, INFINITE) == WAIT_OBJECT_0 {
+            _ = PostMessageW(Some(context.window), WM_OWNER_GONE, WPARAM(0), LPARAM(0));
+        }
+    }
+    0
 }
 
 unsafe fn detach() {
@@ -235,15 +336,27 @@ unsafe fn detach() {
         _ = RemoveWindowSubclass(state.list_view, Some(list_view_proc), SUBCLASS_ID);
         _ = InvalidateRect(Some(state.list_view), None, true);
         _ = DestroyWindow(state.window);
-        let module = state.module;
+        if let Some((_, context)) = state.watch {
+            _ = SetEvent((*context).stop);
+        }
+        let unload_context = Box::into_raw(Box::new(Unload { module: state.module, watch: state.watch }));
         drop(state);
-        _ = CreateThread(None, 0, Some(unload), Some(module.0 as *const c_void), THREAD_CREATION_FLAGS(0), None);
+        _ = CreateThread(None, 0, Some(unload), Some(unload_context as *const c_void), THREAD_CREATION_FLAGS(0), None);
     }
 }
 
-unsafe extern "system" fn unload(module: *mut c_void) -> u32 {
-    let module = HMODULE(module);
+unsafe extern "system" fn unload(context: *mut c_void) -> u32 {
     unsafe {
+        let context = Box::from_raw(context as *mut Unload);
+        if let Some((thread, watch)) = context.watch {
+            WaitForSingleObject(thread, INFINITE);
+            _ = CloseHandle(thread);
+            let watch = Box::from_raw(watch);
+            _ = CloseHandle(watch.process);
+            _ = CloseHandle(watch.stop);
+        }
+        let module = context.module;
+        drop(context);
         _ = UnregisterClassW(&HSTRING::from(protocol::WINDOW_CLASS), Some(module.into()));
         FreeLibraryAndExitThread(module, 0)
     }
