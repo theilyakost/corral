@@ -21,3 +21,6 @@ windows = { version = "0.61.1", features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[workspace]
+members = ["agent"]

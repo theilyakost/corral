@@ -1,0 +1,250 @@
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::ffi::c_void;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use windows::Win32::Foundation::{FreeLibrary, HMODULE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, IServiceProvider};
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+use windows::Win32::System::LibraryLoader::{
+    FreeLibraryAndExitThread, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleHandleExW,
+};
+use windows::Win32::System::Threading::{CreateThread, GetCurrentThreadId, THREAD_CREATION_FLAGS};
+use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::UI::Controls::{
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_NOTIFYITEMDRAW, CDRF_SKIPDEFAULT, LVHITTESTINFO, LVM_HITTEST,
+    NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR,
+};
+use windows::Win32::UI::Shell::Common::STRRET;
+use windows::Win32::UI::Shell::{
+    CSIDL_DESKTOP, DefSubclassProc, IFolderView2, IShellBrowser, IShellFolder, IShellWindows, RemoveWindowSubclass,
+    SHGDN_FORPARSING, SHGDN_INFOLDER, SHGDNF, SID_STopLevelBrowser, SWC_DESKTOP, SWFO_NEEDDISPATCH,
+    SetWindowSubclass, ShellWindows, StrRetToStrW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, FindWindowW,
+    GetWindowThreadProcessId, HWND_MESSAGE, RegisterClassW, SendMessageW, UnregisterClassW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_COPYDATA, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NOTIFY, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WNDCLASSW,
+};
+use windows::core::{HSTRING, Interface, PCWSTR, PWSTR, Result, w};
+
+use crate::protocol::{self, CMD_DETACH, CMD_SET_HIDDEN};
+
+const SUBCLASS_ID: usize = 0xC0AA;
+
+struct ThreadBound<T>(T);
+
+unsafe impl<T> Sync for ThreadBound<T> {}
+
+struct State {
+    module: HMODULE,
+    def_view: HWND,
+    list_view: HWND,
+    window: HWND,
+    view: IFolderView2,
+    folder: IShellFolder,
+    hidden: HashSet<String>,
+}
+
+static STARTED: AtomicBool = AtomicBool::new(false);
+static STATE: ThreadBound<RefCell<Option<State>>> = ThreadBound(RefCell::new(None));
+
+#[unsafe(no_mangle)]
+pub extern "system" fn corral_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if !STARTED.swap(true, Ordering::SeqCst) {
+        _ = catch_unwind(|| unsafe { attach() });
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+unsafe fn attach() -> Result<()> {
+    unsafe {
+        let progman = FindWindowW(w!("Progman"), None)?;
+        let def_view = FindWindowExW(Some(progman), None, w!("SHELLDLL_DefView"), None)?;
+        let list_view = FindWindowExW(Some(def_view), None, w!("SysListView32"), None)?;
+        if GetWindowThreadProcessId(list_view, None) != GetCurrentThreadId() {
+            return Ok(());
+        }
+
+        let mut module = HMODULE::default();
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            PCWSTR(corral_hook_proc as *const u16),
+            &mut module,
+        )?;
+        let setup = || -> Result<State> {
+            let (view, folder) = shell_view()?;
+            let class_name = HSTRING::from(protocol::WINDOW_CLASS);
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(agent_proc),
+                hInstance: module.into(),
+                lpszClassName: PCWSTR(class_name.as_ptr()),
+                ..Default::default()
+            };
+            RegisterClassW(&class);
+            let window = CreateWindowExW(
+                WINDOW_EX_STYLE::default(), &class_name, None, WINDOW_STYLE::default(),
+                0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(module.into()), None,
+            )?;
+            Ok(State { module, def_view, list_view, window, view, folder, hidden: HashSet::new() })
+        };
+        let state = match setup() {
+            Ok(state) => state,
+            Err(e) => {
+                _ = FreeLibrary(module);
+                return Err(e);
+            }
+        };
+
+        *STATE.0.borrow_mut() = Some(state);
+        _ = SetWindowSubclass(def_view, Some(def_view_proc), SUBCLASS_ID, 0);
+        _ = SetWindowSubclass(list_view, Some(list_view_proc), SUBCLASS_ID, 0);
+        Ok(())
+    }
+}
+
+unsafe fn shell_view() -> Result<(IFolderView2, IShellFolder)> {
+    unsafe {
+        let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_ALL)?;
+        let location = VARIANT::from(CSIDL_DESKTOP as i32);
+        let empty = VARIANT::default();
+        let mut hwnd = 0i32;
+        let dispatch = windows.FindWindowSW(&location, &empty, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
+        let provider: IServiceProvider = dispatch.cast()?;
+        let browser: IShellBrowser = provider.QueryService(&SID_STopLevelBrowser)?;
+        let view: IFolderView2 = browser.QueryActiveShellView()?.cast()?;
+        let folder: IShellFolder = view.GetFolder()?;
+        Ok((view, folder))
+    }
+}
+
+fn is_hidden(index: usize) -> bool {
+    let Ok(state) = STATE.0.try_borrow() else { return false };
+    let Some(state) = state.as_ref() else { return false };
+    if state.hidden.is_empty() {
+        return false;
+    }
+    unsafe {
+        let Ok(pidl) = state.view.Item(index as i32) else { return false };
+        let mut strret = STRRET::default();
+        let flags = SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0);
+        let mut hidden = false;
+        if state.folder.GetDisplayNameOf(pidl, flags, &mut strret).is_ok() {
+            let mut text = PWSTR::null();
+            if StrRetToStrW(&mut strret, Some(pidl), &mut text).is_ok() {
+                hidden = text.to_string().is_ok_and(|name| state.hidden.contains(&name.to_lowercase()));
+                CoTaskMemFree(Some(text.0 as _));
+            }
+        }
+        CoTaskMemFree(Some(pidl as _));
+        hidden
+    }
+}
+
+fn list_view() -> Option<HWND> {
+    STATE.0.try_borrow().ok()?.as_ref().map(|s| s.list_view)
+}
+
+unsafe extern "system" fn def_view_proc(
+    hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize,
+) -> LRESULT {
+    if msg == WM_NOTIFY {
+        let handled = catch_unwind(AssertUnwindSafe(|| unsafe { custom_draw(hwnd, msg, wparam, lparam) }));
+        if let Ok(Some(result)) = handled {
+            return result;
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+unsafe fn custom_draw(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    unsafe {
+        let header = &*(lparam.0 as *const NMHDR);
+        if header.code != NM_CUSTOMDRAW || Some(header.hwndFrom) != list_view() {
+            return None;
+        }
+        let draw = &*(lparam.0 as *const NMCUSTOMDRAW);
+        if draw.dwDrawStage == CDDS_PREPAINT {
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            return Some(LRESULT(result.0 | CDRF_NOTIFYITEMDRAW as isize));
+        }
+        if draw.dwDrawStage == CDDS_ITEMPREPAINT && is_hidden(draw.dwItemSpec) {
+            return Some(LRESULT(CDRF_SKIPDEFAULT as isize));
+        }
+        None
+    }
+}
+
+unsafe extern "system" fn list_view_proc(
+    hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize,
+) -> LRESULT {
+    let is_click = matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN);
+    if is_click {
+        let blocked = catch_unwind(AssertUnwindSafe(|| unsafe { hits_hidden(hwnd, lparam) }));
+        if matches!(blocked, Ok(true)) {
+            return LRESULT(0);
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+unsafe fn hits_hidden(hwnd: HWND, lparam: LPARAM) -> bool {
+    let point = POINT { x: (lparam.0 & 0xFFFF) as i16 as i32, y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 };
+    let mut info = LVHITTESTINFO { pt: point, ..Default::default() };
+    let index = unsafe { SendMessageW(hwnd, LVM_HITTEST, None, Some(LPARAM(&mut info as *mut _ as isize))) };
+    index.0 >= 0 && is_hidden(index.0 as usize)
+}
+
+unsafe extern "system" fn agent_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_COPYDATA {
+        let handled = catch_unwind(AssertUnwindSafe(|| unsafe { command(&*(lparam.0 as *const COPYDATASTRUCT)) }));
+        return LRESULT(handled.is_ok() as isize);
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+unsafe fn command(data: &COPYDATASTRUCT) {
+    match data.dwData {
+        CMD_SET_HIDDEN => {
+            let words = if data.lpData.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data.lpData as *const u16, data.cbData as usize / 2) }
+            };
+            let names = protocol::decode_names(words);
+            let list_view = {
+                let Ok(mut state) = STATE.0.try_borrow_mut() else { return };
+                let Some(state) = state.as_mut() else { return };
+                state.hidden = names.into_iter().map(|n| n.to_lowercase()).collect();
+                state.list_view
+            };
+            unsafe { _ = InvalidateRect(Some(list_view), None, true) };
+        }
+        CMD_DETACH => unsafe { detach() },
+        _ => {}
+    }
+}
+
+unsafe fn detach() {
+    let Some(state) = STATE.0.try_borrow_mut().ok().and_then(|mut s| s.take()) else { return };
+    unsafe {
+        _ = RemoveWindowSubclass(state.def_view, Some(def_view_proc), SUBCLASS_ID);
+        _ = RemoveWindowSubclass(state.list_view, Some(list_view_proc), SUBCLASS_ID);
+        _ = InvalidateRect(Some(state.list_view), None, true);
+        _ = DestroyWindow(state.window);
+        let module = state.module;
+        drop(state);
+        _ = CreateThread(None, 0, Some(unload), Some(module.0 as *const c_void), THREAD_CREATION_FLAGS(0), None);
+    }
+}
+
+unsafe extern "system" fn unload(module: *mut c_void) -> u32 {
+    let module = HMODULE(module);
+    unsafe {
+        _ = UnregisterClassW(&HSTRING::from(protocol::WINDOW_CLASS), Some(module.into()));
+        FreeLibraryAndExitThread(module, 0)
+    }
+}
