@@ -95,10 +95,7 @@ impl Config {
     }
 
     pub fn group_of(&self, file_name: &str) -> Option<usize> {
-        self.groups
-            .iter()
-            .position(|g| g.holds(file_name))
-            .or_else(|| self.groups.iter().position(|g| g.matches(file_name) && !g.rejects(file_name)))
+        group_of(&self.groups, file_name)
     }
 
     pub fn put(&mut self, index: usize, file_name: &str) {
@@ -142,6 +139,13 @@ impl Config {
             ],
         }
     }
+}
+
+pub fn group_of(groups: &[Group], file_name: &str) -> Option<usize> {
+    groups
+        .iter()
+        .position(|g| g.holds(file_name))
+        .or_else(|| groups.iter().position(|g| g.matches(file_name) && !g.rejects(file_name)))
 }
 
 pub fn glob_match(pattern: &str, name: &str) -> bool {

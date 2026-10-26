@@ -1,13 +1,17 @@
 #![windows_subsystem = "windows"]
 
+mod agent;
 mod config;
 mod desktop;
 mod group;
 mod layout;
+mod shelf;
+mod shell;
 mod watcher;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
@@ -16,13 +20,16 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, ShellExecuteW, Shell_NotifyIconW};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetMessageW, IDI_APPLICATION, KillTimer, LoadIconW, MB_ICONERROR, MF_SEPARATOR, MF_STRING, MSG,
+    GetCursorPos, GetMessageW, IDI_APPLICATION, KillTimer, LoadIconW, MB_ICONERROR, MB_ICONWARNING, MF_CHECKED,
+    MF_SEPARATOR, MF_STRING, MSG,
     MessageBoxW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow,
     SetTimer, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_DESTROY,
     WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
+use windows::Win32::UI::Shell::IShellItem;
 use windows::core::{HSTRING, w};
 
+use agent::Agent;
 use config::{Config, Group};
 use desktop::{Desktop, DesktopItem};
 use group::GroupWindows;
@@ -35,7 +42,9 @@ const TIMER_ATTACH: usize = 2;
 const CMD_OPEN_CONFIG: usize = 1;
 const CMD_RELOAD: usize = 2;
 const CMD_EXIT: usize = 3;
+const CMD_AGENT: usize = 4;
 const MAX_RETRIES: u32 = 3;
+const AGENT_GRACE: Duration = Duration::from_secs(60);
 
 struct App {
     main: HWND,
@@ -44,6 +53,12 @@ struct App {
     windows: Vec<GroupWindows>,
     drag: Option<Drag>,
     retries: u32,
+    agent: Option<Agent>,
+}
+
+struct Arranged {
+    moved: usize,
+    members: Vec<Vec<(String, IShellItem)>>,
 }
 
 struct Snapshot {
@@ -82,6 +97,10 @@ fn show_error(text: &str) {
     unsafe { MessageBoxW(None, &HSTRING::from(text), w!("Corral"), MB_ICONERROR) };
 }
 
+fn handles() -> Option<(HWND, HWND, HWND)> {
+    DESKTOP.with(|cell| cell.try_borrow().ok()?.as_ref().map(|d| (d.host, d.def_view, d.list_view())))
+}
+
 fn main() {
     unsafe {
         _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -115,7 +134,7 @@ fn main() {
         };
 
         APP.with(|cell| {
-            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0 });
+            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0, agent: None });
         });
         add_tray_icon(main);
         watcher::watch_desktop(main, WM_APP_DESKTOP_CHANGED);
@@ -134,13 +153,49 @@ fn attach() {
         return schedule(TIMER_ATTACH, 2000);
     };
     _ = desktop.disable_auto_arrange();
-    let (host, def_view) = (desktop.host, desktop.def_view);
+    let (host, def_view, list_view) = (desktop.host, desktop.def_view, desktop.list_view());
     let stored = DESKTOP.with(|cell| cell.try_borrow_mut().map(|mut d| *d = Some(desktop)).is_ok());
     if !stored {
         return schedule(TIMER_ATTACH, 200);
     }
+    connect_agent(list_view);
     rebuild_windows(host, def_view);
     layout_icons();
+}
+
+fn connect_agent(list_view: HWND) {
+    if agent::disabled_flag().exists() || with_app(|app| app.agent.is_some()) != Some(false) {
+        return;
+    }
+    let agent = Agent::inject(list_view).ok();
+    with_app(|app| app.agent = agent);
+}
+
+fn check_agent() {
+    let lost = with_app(|app| app.agent.as_ref().is_some_and(|a| !a.alive())) == Some(true);
+    if lost {
+        with_app(|app| app.agent = None);
+        if let Some((host, def_view, _)) = handles() {
+            rebuild_windows(host, def_view);
+        }
+    }
+}
+
+fn toggle_agent() {
+    let flag = agent::disabled_flag();
+    if flag.exists() {
+        _ = std::fs::remove_file(&flag);
+        if let Some((_, _, list_view)) = handles() {
+            connect_agent(list_view);
+        }
+    } else {
+        _ = std::fs::write(&flag, "");
+        with_app(|app| app.agent = None);
+    }
+    if let Some((host, def_view, _)) = handles() {
+        rebuild_windows(host, def_view);
+        layout_icons();
+    }
 }
 
 fn detach() {
@@ -152,9 +207,9 @@ fn detach() {
 }
 
 fn rebuild_windows(host: HWND, def_view: HWND) {
-    let Some((old, groups, instance)) =
-        with_app(|app| (std::mem::take(&mut app.windows), app.config.groups.clone(), app.instance))
-    else {
+    let Some((old, groups, instance, owned)) = with_app(|app| {
+        (std::mem::take(&mut app.windows), app.config.groups.clone(), app.instance, app.agent.is_some())
+    }) else {
         return;
     };
     for windows in old {
@@ -163,18 +218,29 @@ fn rebuild_windows(host: HWND, def_view: HWND) {
     let created: Vec<GroupWindows> = groups
         .iter()
         .enumerate()
-        .filter_map(|(index, group)| GroupWindows::create(index, group, host, def_view, instance).ok())
+        .filter_map(|(index, group)| GroupWindows::create(index, group, host, def_view, instance, owned).ok())
         .collect();
     with_app(|app| app.windows = created);
 }
 
 fn layout_icons() {
-    let Some(groups) = with_app(|app| app.config.groups.clone()) else {
+    check_agent();
+    let Some((groups, owned)) = with_app(|app| (app.config.groups.clone(), app.agent.is_some())) else {
         return schedule(TIMER_LAYOUT, 200);
     };
     let result = DESKTOP.with(|cell| match cell.try_borrow() {
-        Ok(desktop) => desktop.as_ref().map(|d| arrange(d, &groups).map(Some)),
+        Ok(desktop) => desktop.as_ref().map(|d| arrange(d, &groups, owned).map(Some)),
         Err(_) => Some(Ok(None)),
+    });
+    let result = result.map(|r| {
+        r.map(|arranged| {
+            arranged.map(|arranged| {
+                if owned {
+                    show_members(arranged.members);
+                }
+                arranged.moved
+            })
+        })
     });
     match result {
         None => {}
@@ -198,14 +264,59 @@ fn layout_icons() {
     }
 }
 
-fn arrange(desktop: &Desktop, groups: &[Group]) -> windows::core::Result<usize> {
+fn arrange(desktop: &Desktop, groups: &[Group], owned: bool) -> windows::core::Result<Arranged> {
     let mut items = desktop.items()?;
     let grid = Grid::detect(items.iter().map(|i| i.position), desktop.spacing()?);
-    apply(desktop, &mut items, grid, groups)
+    let moved = apply(desktop, &mut items, grid, groups)?;
+    let mut members = vec![Vec::new(); groups.len()];
+    if owned {
+        for item in &items {
+            let Some(list) = config::group_of(groups, &item.name).and_then(|g| members.get_mut(g)) else { continue };
+            if let Ok(shell_item) = desktop.shell_item(item) {
+                list.push((item.name.clone(), shell_item));
+            }
+        }
+        for list in &mut members {
+            list.sort_by_key(|(name, _)| name.to_lowercase());
+        }
+    }
+    Ok(Arranged { moved, members })
+}
+
+fn show_members(members: Vec<Vec<(String, IShellItem)>>) {
+    let names: Vec<String> = members.iter().flatten().map(|(name, _)| name.clone()).collect();
+    let Some((agent, bodies)) =
+        with_app(|app| (app.agent.take(), app.windows.iter().map(|w| (w.index, w.body)).collect::<Vec<_>>()))
+    else {
+        return;
+    };
+    if let Some(mut agent) = agent {
+        agent.set_hidden(names);
+        with_app(|app| app.agent = Some(agent));
+    }
+    for (index, list) in members.into_iter().enumerate() {
+        if let Some(&(_, body)) = bodies.iter().find(|(i, _)| *i == index) {
+            shelf::set_items(body, list);
+        }
+    }
+}
+
+pub fn take_out(index: usize, name: &str) {
+    let config = with_app(|app| {
+        app.config.take_out(index, name);
+        app.config.clone()
+    });
+    if let Some(config) = config {
+        _ = config.save();
+        layout_icons();
+    }
 }
 
 fn apply(desktop: &Desktop, items: &mut [DesktopItem], grid: Grid, groups: &[Group]) -> windows::core::Result<usize> {
-    let icons: Vec<Icon> = items.iter().map(|i| Icon { name: &i.name, position: i.position }).collect();
+    let icons: Vec<Icon> = items
+        .iter()
+        .map(|i| Icon { name: &i.name, position: i.position, group: config::group_of(groups, &i.name) })
+        .collect();
     let moves = layout::plan(&icons, groups, grid, desktop::work_area);
     let batch: Vec<(&DesktopItem, POINT)> = moves.iter().map(|&(i, target)| (&items[i], target)).collect();
     desktop.position(&batch)?;
@@ -299,11 +410,8 @@ fn reload_config() {
         Err(e) => return show_error(&format!("Не удалось прочитать конфиг:\n{e}")),
     };
     with_app(|app| app.config = config);
-    let handles = DESKTOP.with(|cell| {
-        cell.try_borrow().ok().and_then(|d| d.as_ref().map(|d| (d.host, d.def_view)))
-    });
-    match handles {
-        Some((host, def_view)) => {
+    match handles() {
+        Some((host, def_view, _)) => {
             rebuild_windows(host, def_view);
             layout_icons();
         }
@@ -341,6 +449,8 @@ fn show_tray_menu(hwnd: HWND) {
         let Ok(menu) = CreatePopupMenu() else { return };
         _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_CONFIG, w!("Открыть конфиг"));
         _ = AppendMenuW(menu, MF_STRING, CMD_RELOAD, w!("Перечитать конфиг"));
+        let agent_flags = if agent::disabled_flag().exists() { MF_STRING } else { MF_STRING | MF_CHECKED };
+        _ = AppendMenuW(menu, agent_flags, CMD_AGENT, w!("Прятать иконки в группах"));
         _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, w!("Выход"));
         let mut cursor = POINT::default();
@@ -351,6 +461,7 @@ fn show_tray_menu(hwnd: HWND) {
         match command.0 as usize {
             CMD_OPEN_CONFIG => open_config(),
             CMD_RELOAD => reload_config(),
+            CMD_AGENT => toggle_agent(),
             CMD_EXIT => _ = DestroyWindow(hwnd),
             _ => {}
         }
@@ -383,6 +494,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             }
             WM_DESTROY => {
                 _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
+                with_app(|app| app.agent = None);
                 if let Some(windows) = with_app(|app| std::mem::take(&mut app.windows)) {
                     for w in windows {
                         w.destroy();
@@ -395,6 +507,16 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 add_tray_icon(hwnd);
                 detach();
                 SetTimer(Some(hwnd), TIMER_ATTACH, 1500, None);
+                let crashed = with_app(|app| app.agent.take().is_some_and(|a| a.started.elapsed() < AGENT_GRACE));
+                if crashed == Some(true) {
+                    _ = std::fs::write(agent::disabled_flag(), "");
+                    MessageBoxW(
+                        None,
+                        w!("Проводник перезапустился вскоре после подключения агента, поэтому агент отключён.\n\nИконки групп снова видны. Включить агент: меню в трее → «Прятать иконки в группах»."),
+                        w!("Corral"),
+                        MB_ICONWARNING,
+                    );
+                }
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),

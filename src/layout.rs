@@ -11,6 +11,7 @@ const INSET: i32 = 6;
 pub struct Icon<'a> {
     pub name: &'a str,
     pub position: POINT,
+    pub group: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -48,8 +49,8 @@ pub fn plan(icons: &[Icon], groups: &[Group], grid: Grid, work_area: impl Fn(POI
 
     let mut members: Vec<Vec<usize>> = vec![Vec::new(); groups.len()];
     for (i, icon) in icons.iter().enumerate() {
-        if let Some(g) = groups.iter().position(|g| g.matches(icon.name)) {
-            members[g].push(i);
+        if let Some(list) = icon.group.and_then(|g| members.get_mut(g)) {
+            list.push(i);
         }
     }
     let mut member_moves = Vec::new();
@@ -127,6 +128,7 @@ fn free_cell(area: RECT, grid: Grid, groups: &[RECT], occupied: &[RECT]) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::group_of;
 
     const SPACING: POINT = POINT { x: 76, y: 100 };
     const GRID: Grid = Grid { origin: POINT { x: 14, y: 2 }, spacing: SPACING };
@@ -145,7 +147,14 @@ mod tests {
     }
 
     fn icon(name: &str, x: i32, y: i32) -> Icon<'_> {
-        Icon { name, position: POINT { x, y } }
+        Icon { name, position: POINT { x, y }, group: None }
+    }
+
+    fn run(mut icons: Vec<Icon>, groups: &[Group]) -> Vec<(usize, POINT)> {
+        for icon in &mut icons {
+            icon.group = group_of(groups, icon.name);
+        }
+        plan(&icons, groups, GRID, |_| SCREEN)
     }
 
     fn on_grid(p: POINT) -> bool {
@@ -160,8 +169,8 @@ mod tests {
 
     #[test]
     fn members_go_inside_sorted_on_grid() {
-        let icons = [icon("b.txt", 14, 2), icon("a.txt", 14, 102), icon("c.exe", 14, 202)];
-        let moves = plan(&icons, &[group(&["*.txt"])], GRID, |_| SCREEN);
+        let icons = vec![icon("b.txt", 14, 2), icon("a.txt", 14, 102), icon("c.exe", 14, 202)];
+        let moves = run(icons, &[group(&["*.txt"])]);
         assert_eq!(moves.len(), 2);
         let a = moves.iter().find(|(i, _)| *i == 1).unwrap().1;
         let b = moves.iter().find(|(i, _)| *i == 0).unwrap().1;
@@ -173,9 +182,9 @@ mod tests {
 
     #[test]
     fn outsiders_are_pushed_out_first() {
-        let icons = [icon("a.txt", 14, 2), icon("app.exe", 546, 402)];
+        let icons = vec![icon("a.txt", 14, 2), icon("app.exe", 546, 402)];
         let g = group(&["*.txt"]);
-        let moves = plan(&icons, std::slice::from_ref(&g), GRID, |_| SCREEN);
+        let moves = run(icons, std::slice::from_ref(&g));
         assert_eq!(moves.len(), 2);
         assert_eq!(moves[0].0, 1);
         assert!(on_grid(moves[0].1));
@@ -186,20 +195,31 @@ mod tests {
     fn outsiders_are_pushed_out_of_overflow() {
         let mut icons: Vec<Icon> = (0..20).map(|_| icon("f.txt", 14, 2)).collect();
         icons.push(icon("app.exe", 546, 702));
-        let moves = plan(&icons, &[group(&["*.txt"])], GRID, |_| SCREEN);
+        let moves = run(icons, &[group(&["*.txt"])]);
         assert!(moves.iter().any(|(i, _)| *i == 20));
     }
 
     #[test]
     fn nothing_moves_when_already_in_place() {
-        let icons = [icon("app.exe", 14, 2)];
-        assert!(plan(&icons, &[group(&["*.txt"])], GRID, |_| SCREEN).is_empty());
+        assert!(run(vec![icon("app.exe", 14, 2)], &[group(&["*.txt"])]).is_empty());
+    }
+
+    #[test]
+    fn manual_membership_wins_over_rules() {
+        let mut docs = group(&["*.txt"]);
+        docs.exclude.push("b.txt".into());
+        let mut apps = Group { x: 1000, ..group(&[]) };
+        apps.items.push("a.txt".into());
+        let moves = run(vec![icon("a.txt", 14, 2), icon("b.txt", 14, 102)], &[docs, apps]);
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].0, 0);
+        assert!(moves[0].1.x >= 1000);
     }
 
     #[test]
     fn pushed_icons_do_not_stack() {
-        let icons = [icon("a.exe", 546, 402), icon("b.exe", 622, 402)];
-        let moves = plan(&icons, &[group(&["*.txt"])], GRID, |_| SCREEN);
+        let icons = vec![icon("a.exe", 546, 402), icon("b.exe", 622, 402)];
+        let moves = run(icons, &[group(&["*.txt"])]);
         assert_eq!(moves.len(), 2);
         assert_ne!(moves[0].1, moves[1].1);
     }
