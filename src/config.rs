@@ -5,8 +5,50 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub appearance: Appearance,
     #[serde(default, rename = "group")]
     pub groups: Vec<Group>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Appearance {
+    pub header_color: String,
+    pub body_color: String,
+    pub title_color: String,
+    pub header_opacity: u8,
+    pub body_opacity: u8,
+    pub animate: bool,
+    pub hover_open: bool,
+}
+
+impl Default for Appearance {
+    fn default() -> Appearance {
+        Appearance {
+            header_color: "#1A1C20".into(),
+            body_color: "#101214".into(),
+            title_color: "#F0F0F0".into(),
+            header_opacity: 215,
+            body_opacity: 110,
+            animate: true,
+            hover_open: true,
+        }
+    }
+}
+
+pub fn parse_color(text: &str) -> Option<u32> {
+    let hex = text.trim().strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let rgb = u32::from_str_radix(hex, 16).ok()?;
+    Some(((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF))
+}
+
+pub fn format_color(colorref: u32) -> String {
+    let (r, g, b) = (colorref & 0xFF, (colorref >> 8) & 0xFF, (colorref >> 16) & 0xFF);
+    format!("#{r:02X}{g:02X}{b:02X}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +159,7 @@ impl Config {
 
     fn starter() -> Config {
         Config {
+            appearance: Appearance::default(),
             groups: vec![
                 Group {
                     name: "Документы".into(),
@@ -205,6 +248,21 @@ mod tests {
         assert_eq!(config.group_of("тест.EXE"), Some(0));
         config.take_out(0, "тест.exe");
         assert_eq!(config.group_of("Тест.exe"), None);
+    }
+
+    #[test]
+    fn colors() {
+        assert_eq!(parse_color("#1A1C20"), Some(0x00201C1A));
+        assert_eq!(parse_color("bad"), None);
+        assert_eq!(format_color(0x00201C1A), "#1A1C20");
+        let old: Config = toml::from_str(r#"[[group]]
+name = "a"
+x = 0
+y = 0
+width = 1
+height = 1
+"#).unwrap();
+        assert_eq!(old.appearance, Appearance::default());
     }
 
     #[test]

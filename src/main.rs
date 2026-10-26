@@ -1,26 +1,31 @@
 #![windows_subsystem = "windows"]
 
 mod agent;
+mod autostart;
 mod config;
 mod desktop;
 mod group;
+mod icon;
 mod layout;
+mod settings;
 mod shelf;
 mod shell;
 mod watcher;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, ShellExecuteW, Shell_NotifyIconW};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetMessageW, IDI_APPLICATION, KillTimer, LoadIconW, MB_ICONERROR, MB_ICONWARNING, MF_CHECKED,
+    GetCursorPos, GetMessageW, IsDialogMessageW, KillTimer, MB_ICONERROR, MB_ICONWARNING, WM_LBUTTONUP,
     MF_SEPARATOR, MF_STRING, MSG,
     MessageBoxW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow,
     SetTimer, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_DESTROY,
@@ -30,7 +35,7 @@ use windows::Win32::UI::Shell::IShellItem;
 use windows::core::{HSTRING, w};
 
 use agent::Agent;
-use config::{Config, Group};
+use config::{Appearance, Config, Group};
 use desktop::{Desktop, DesktopItem};
 use group::GroupWindows;
 use layout::{Frame, Grid, Icon};
@@ -40,11 +45,16 @@ const WM_APP_DESKTOP_CHANGED: u32 = WM_APP + 2;
 const TIMER_LAYOUT: usize = 1;
 const TIMER_ATTACH: usize = 2;
 const TIMER_PEEK: usize = 3;
+const TIMER_ANIMATE: usize = 4;
+const OPEN_DURATION: Duration = Duration::from_millis(180);
+const CLOSE_DURATION: Duration = Duration::from_millis(140);
 const DRAG_THRESHOLD: i32 = 4;
 const CMD_OPEN_CONFIG: usize = 1;
 const CMD_RELOAD: usize = 2;
 const CMD_EXIT: usize = 3;
-const CMD_AGENT: usize = 4;
+const CMD_SETTINGS: usize = 4;
+const CMD_NEW_GROUP: usize = 5;
+const INSTANCE_WAIT_MS: u32 = 3000;
 const MAX_RETRIES: u32 = 3;
 const AGENT_GRACE: Duration = Duration::from_secs(60);
 
@@ -57,6 +67,26 @@ struct App {
     retries: u32,
     agent: Option<Agent>,
     peek: Option<usize>,
+    animations: Vec<Animation>,
+}
+
+struct Animation {
+    index: usize,
+    from: f32,
+    to: f32,
+    started: Instant,
+}
+
+impl Animation {
+    fn progress(&self, now: Instant) -> f32 {
+        let duration = if self.to > self.from { OPEN_DURATION } else { CLOSE_DURATION };
+        (now.duration_since(self.started).as_secs_f32() / duration.as_secs_f32()).min(1.0)
+    }
+
+    fn fraction(&self, now: Instant) -> f32 {
+        let eased = 1.0 - (1.0 - self.progress(now)).powi(3);
+        self.from + (self.to - self.from) * eased
+    }
 }
 
 impl App {
@@ -119,18 +149,24 @@ fn main() {
     unsafe {
         _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-        let _guard = CreateMutexW(None, true, w!("Local\\CorralSingleInstance"));
+        let guard = CreateMutexW(None, true, w!("Local\\CorralSingleInstance"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            return;
+            let Ok(handle) = &guard else { return };
+            let waited = WaitForSingleObject(*handle, INSTANCE_WAIT_MS);
+            if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
+                return;
+            }
         }
 
         let config = match Config::load_or_create() {
             Ok(config) => config,
             Err(e) => return show_error(&format!("Не удалось прочитать конфиг:\n{e}")),
         };
+        group::set_style(&config.appearance);
 
         let instance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
         group::register_classes(instance);
+        settings::register(instance);
         let class = WNDCLASSW {
             lpfnWndProc: Some(main_proc),
             hInstance: instance,
@@ -148,7 +184,7 @@ fn main() {
         };
 
         APP.with(|cell| {
-            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0, agent: None, peek: None });
+            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0, agent: None, peek: None, animations: Vec::new() });
         });
         add_tray_icon(main);
         watcher::watch_desktop(main, WM_APP_DESKTOP_CHANGED);
@@ -156,6 +192,9 @@ fn main() {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if settings::window().is_some_and(|w| IsDialogMessageW(w, &msg).as_bool()) {
+                continue;
+            }
             _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -215,6 +254,114 @@ fn check_agent() {
     }
 }
 
+pub fn config() -> Option<Config> {
+    with_app(|app| app.config.clone())
+}
+
+fn save_config() {
+    if let Some(config) = config() {
+        _ = config.save();
+    }
+}
+
+fn rebuild_and_layout() {
+    if let Some((host, def_view, _)) = handles() {
+        rebuild_windows(host, def_view);
+        layout_icons();
+    }
+}
+
+pub fn rename_group(index: usize, name: &str) {
+    let renamed = with_app(|app| {
+        let group = app.config.groups.get_mut(index)?;
+        group.name = name.to_string();
+        let group = group.clone();
+        let windows = *app.windows.iter().find(|w| w.index == index)?;
+        Some((windows, group, app.agent.is_some()))
+    });
+    if let Some(Some((windows, group, owned))) = renamed {
+        if owned {
+            windows.set_marker(&group, group.collapsed);
+        } else {
+            windows.set_title(&group.name);
+        }
+    }
+    save_config();
+}
+
+pub fn set_rules(index: usize, rules: Vec<String>) {
+    let changed = with_app(|app| {
+        let group = app.config.groups.get_mut(index)?;
+        (group.rules != rules).then(|| group.rules = rules)
+    });
+    if let Some(Some(())) = changed {
+        save_config();
+        layout_icons();
+    }
+}
+
+pub fn set_collapsed(index: usize, collapsed: bool) {
+    let current = with_app(|app| app.config.groups.get(index).map(|g| g.collapsed)).flatten();
+    if current.is_some_and(|c| c != collapsed) {
+        toggle_collapsed(index);
+    }
+}
+
+pub fn add_group() -> Option<usize> {
+    let area = desktop::work_area(POINT::default());
+    let index = with_app(|app| {
+        let (width, height) = (4 * 76, 3 * 100);
+        let x = (area.left + area.right - width) / 2;
+        let y = (area.top + area.bottom - height) / 2;
+        let name = format!("Группа {}", app.config.groups.len() + 1);
+        app.config.groups.push(Group { name, x, y, width, height, ..Group::empty() });
+        app.config.groups.len() - 1
+    })?;
+    fit_groups();
+    save_config();
+    rebuild_and_layout();
+    Some(index)
+}
+
+pub fn remove_group(index: usize) {
+    let removed = with_app(|app| (index < app.config.groups.len()).then(|| app.config.groups.remove(index)));
+    if let Some(Some(_)) = removed {
+        save_config();
+        rebuild_and_layout();
+    }
+}
+
+pub fn set_appearance(appearance: Appearance) {
+    group::set_style(&appearance);
+    let windows = with_app(|app| {
+        app.config.appearance = appearance;
+        app.windows.clone()
+    });
+    for windows in windows.unwrap_or_default() {
+        windows.restyle();
+        shelf::render(windows.body);
+    }
+    save_config();
+}
+
+pub fn agent_enabled() -> bool {
+    !agent::disabled_flag().exists()
+}
+
+pub fn set_agent(enabled: bool) {
+    if enabled != agent_enabled() {
+        toggle_agent();
+    }
+}
+
+pub fn set_autostart(enabled: bool) {
+    if enabled != autostart::enabled() {
+        if let Some(main) = with_app(|app| app.main) {
+            toggle_autostart(main);
+        }
+    }
+}
+
 fn toggle_agent() {
     let flag = agent::disabled_flag();
     if flag.exists() {
@@ -243,6 +390,7 @@ fn detach() {
 fn rebuild_windows(host: HWND, def_view: HWND) {
     let Some((old, groups, instance, owned)) = with_app(|app| {
         app.peek = None;
+        app.animations.clear();
         (std::mem::take(&mut app.windows), app.config.groups.clone(), app.instance, app.agent.is_some())
     }) else {
         return;
@@ -481,7 +629,9 @@ fn toggle_collapsed(index: usize) {
         Some((windows, group, app.config.clone()))
     });
     let Some(Some((windows, group, config))) = changed else { return };
-    windows.set_collapsed(&group, group.collapsed);
+    windows.set_marker(&group, group.collapsed);
+    animate(index, !group.collapsed);
+    settings::refresh();
     if group.collapsed {
         schedule(TIMER_PEEK, 150);
     }
@@ -491,21 +641,77 @@ fn toggle_collapsed(index: usize) {
 
 pub fn hover_header(index: usize) {
     let opened = with_app(|app| {
-        let collapsed = app.agent.is_some() && app.config.groups.get(index).is_some_and(|g| g.collapsed);
+        let collapsed = app.agent.is_some()
+            && app.config.appearance.hover_open
+            && app.config.groups.get(index).is_some_and(|g| g.collapsed);
         if !collapsed || app.drag.is_some() || app.peek == Some(index) {
             return None;
         }
-        let previous = app.peek.and_then(|p| app.windows.iter().find(|w| w.index == p).copied());
-        app.peek = Some(index);
-        let windows = *app.windows.iter().find(|w| w.index == index)?;
-        Some((previous, windows))
+        Some(app.peek.replace(index))
     });
-    let Some(Some((previous, windows))) = opened else { return };
+    let Some(Some(previous)) = opened else { return };
     if let Some(previous) = previous {
-        previous.set_open(false);
+        animate(previous, false);
     }
-    windows.set_open(true);
+    animate(index, true);
     schedule(TIMER_PEEK, 150);
+}
+
+fn animate(index: usize, open: bool) {
+    let now = Instant::now();
+    let started = with_app(|app| {
+        let windows = *app.windows.iter().find(|w| w.index == index)?;
+        if !app.config.appearance.animate {
+            app.animations.retain(|a| a.index != index);
+            return Some((windows, app.config.groups.get(index)?.clone(), None));
+        }
+        let from = match app.animations.iter().position(|a| a.index == index) {
+            Some(i) => app.animations.remove(i).fraction(now),
+            None if windows.is_open() => 1.0,
+            None => 0.0,
+        };
+        app.animations.push(Animation { index, from, to: if open { 1.0 } else { 0.0 }, started: now });
+        Some((windows, app.config.groups.get(index)?.clone(), Some(from)))
+    });
+    let Some(Some((windows, group, from))) = started else { return };
+    let Some(from) = from else {
+        windows.place(&group);
+        windows.set_open(open);
+        return;
+    };
+    if open {
+        windows.reveal(&group, from);
+        windows.set_open(true);
+    }
+    schedule(TIMER_ANIMATE, 10);
+}
+
+fn step_animations() {
+    let now = Instant::now();
+    let frames = with_app(|app| {
+        let (windows, groups) = (&app.windows, &app.config.groups);
+        let mut frames = Vec::new();
+        app.animations.retain(|a| {
+            let done = a.progress(now) >= 1.0;
+            if let (Some(w), Some(g)) = (windows.iter().find(|w| w.index == a.index), groups.get(a.index)) {
+                frames.push((*w, g.clone(), a.fraction(now), done && a.to == 0.0));
+            }
+            !done
+        });
+        (frames, !app.animations.is_empty())
+    });
+    let Some((frames, more)) = frames else { return };
+    for (windows, group, fraction, hide) in frames {
+        if hide {
+            windows.set_open(false);
+            windows.place(&group);
+        } else {
+            windows.reveal(&group, fraction);
+        }
+    }
+    if more {
+        schedule(TIMER_ANIMATE, 10);
+    }
 }
 
 fn check_peek() {
@@ -523,10 +729,10 @@ fn check_peek() {
             return Some(None);
         }
         app.peek = None;
-        Some(app.windows.iter().find(|w| w.index == index).copied())
+        Some(Some(index))
     });
     match closed {
-        Some(Some(Some(windows))) => windows.set_open(false),
+        Some(Some(Some(index))) => animate(index, false),
         Some(Some(None)) => schedule(TIMER_PEEK, 150),
         _ => {}
     }
@@ -537,7 +743,9 @@ fn reload_config() {
         Ok(config) => config,
         Err(e) => return show_error(&format!("Не удалось прочитать конфиг:\n{e}")),
     };
+    group::set_style(&config.appearance);
     with_app(|app| app.config = config);
+    settings::refresh();
     match handles() {
         Some((host, def_view, _)) => {
             fit_groups();
@@ -560,7 +768,7 @@ fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
         uID: 1,
         uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
         uCallbackMessage: WM_APP_TRAY,
-        hIcon: unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() },
+        hIcon: icon::tray_icon(),
         ..Default::default()
     };
     for (dst, src) in data.szTip.iter_mut().zip("Corral".encode_utf16()) {
@@ -573,13 +781,35 @@ fn add_tray_icon(hwnd: HWND) {
     unsafe { _ = Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)) };
 }
 
+fn toggle_autostart(main: HWND) {
+    if autostart::enabled() {
+        if let Err(e) = autostart::disable() {
+            show_error(&format!("Не удалось убрать автозапуск:\n{e}"));
+        }
+        return;
+    }
+    if let Err(e) = autostart::enable() {
+        return show_error(&format!("Не удалось включить автозапуск:\n{e}"));
+    }
+    if !autostart::is_installed_copy() && autostart::run_task().is_ok() {
+        unsafe { _ = DestroyWindow(main) };
+    }
+}
+
+fn open_settings() {
+    if let Some(instance) = with_app(|app| app.instance) {
+        settings::open(instance);
+    }
+}
+
 fn show_tray_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
+        _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, w!("Настройки…"));
+        _ = AppendMenuW(menu, MF_STRING, CMD_NEW_GROUP, w!("Новая группа"));
+        _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_CONFIG, w!("Открыть конфиг"));
         _ = AppendMenuW(menu, MF_STRING, CMD_RELOAD, w!("Перечитать конфиг"));
-        let agent_flags = if agent::disabled_flag().exists() { MF_STRING } else { MF_STRING | MF_CHECKED };
-        _ = AppendMenuW(menu, agent_flags, CMD_AGENT, w!("Прятать иконки в группах"));
         _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, w!("Выход"));
         let mut cursor = POINT::default();
@@ -590,7 +820,11 @@ fn show_tray_menu(hwnd: HWND) {
         match command.0 as usize {
             CMD_OPEN_CONFIG => open_config(),
             CMD_RELOAD => reload_config(),
-            CMD_AGENT => toggle_agent(),
+            CMD_SETTINGS => open_settings(),
+            CMD_NEW_GROUP => {
+                add_group();
+                settings::refresh();
+            }
             CMD_EXIT => _ = DestroyWindow(hwnd),
             _ => {}
         }
@@ -611,18 +845,25 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     TIMER_LAYOUT => layout_icons(),
                     TIMER_ATTACH => attach(),
                     TIMER_PEEK => check_peek(),
+                    TIMER_ANIMATE => step_animations(),
                     _ => {}
                 }
                 LRESULT(0)
             }
             WM_APP_TRAY => {
                 let event = (lparam.0 & 0xFFFF) as u32;
+                if event == WM_LBUTTONUP {
+                    open_settings();
+                }
                 if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                     show_tray_menu(hwnd);
                 }
                 LRESULT(0)
             }
             WM_DESTROY => {
+                if let Some(settings) = settings::window() {
+                    _ = DestroyWindow(settings);
+                }
                 _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
                 with_app(|app| app.agent = None);
                 if let Some(windows) = with_app(|app| std::mem::take(&mut app.windows)) {

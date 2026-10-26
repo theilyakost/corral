@@ -386,7 +386,7 @@ pub unsafe extern "system" fn shelf_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
         }
         match msg {
             WM_PAINT => {
-                crate::group::paint(hwnd, crate::group::BODY_COLOR, false);
+                crate::group::paint(hwnd, crate::group::body_color(), false);
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
