@@ -33,7 +33,7 @@ use agent::Agent;
 use config::{Config, Group};
 use desktop::{Desktop, DesktopItem};
 use group::GroupWindows;
-use layout::{Grid, Icon};
+use layout::{Frame, Grid, Icon};
 
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_DESKTOP_CHANGED: u32 = WM_APP + 2;
@@ -77,15 +77,15 @@ struct Arranged {
 struct Snapshot {
     items: Vec<DesktopItem>,
     grid: Grid,
-    applied: Option<POINT>,
+    applied: Option<Frame>,
 }
 
 #[derive(Clone, Copy)]
 struct Drag {
     index: usize,
     cursor: POINT,
-    x: i32,
-    y: i32,
+    start: Frame,
+    resize: Option<(bool, bool)>,
     moved: bool,
 }
 
@@ -173,8 +173,28 @@ fn attach() {
         return schedule(TIMER_ATTACH, 200);
     }
     connect_agent(list_view);
+    fit_groups();
     rebuild_windows(host, def_view);
     layout_icons();
+}
+
+fn fit_groups() {
+    let Some(snapshot) = take_snapshot() else { return };
+    let changed = with_app(|app| {
+        let mut changed = false;
+        for group in &mut app.config.groups {
+            let center = POINT { x: group.x + group.width / 2, y: group.y + group::HEADER_HEIGHT / 2 };
+            let fitted = layout::fit_group(Frame::of(group), Some(snapshot.grid), desktop::work_area(center));
+            if fitted != Frame::of(group) {
+                fitted.apply(group);
+                changed = true;
+            }
+        }
+        changed.then(|| app.config.clone())
+    });
+    if let Some(Some(config)) = changed {
+        _ = config.save();
+    }
 }
 
 fn connect_agent(list_view: HWND) {
@@ -285,6 +305,7 @@ fn arrange(desktop: &Desktop, groups: &[Group], owned: bool) -> windows::core::R
     let moved = apply(desktop, &mut items, grid, groups)?;
     let mut members = vec![Vec::new(); groups.len()];
     if owned {
+        shelf::set_spacing(grid.spacing);
         for item in &items {
             let Some(list) = config::group_of(groups, &item.name).and_then(|g| members.get_mut(g)) else { continue };
             if let Ok(shell_item) = desktop.shell_item(item) {
@@ -352,11 +373,19 @@ fn take_snapshot() -> Option<Snapshot> {
 }
 
 pub fn begin_drag(index: usize) {
+    begin(index, None);
+}
+
+pub fn begin_resize(index: usize, right: bool, bottom: bool) {
+    begin(index, Some((right, bottom)));
+}
+
+fn begin(index: usize, resize: Option<(bool, bool)>) {
     let mut cursor = POINT::default();
     unsafe { _ = GetCursorPos(&mut cursor) };
     with_app(|app| {
         if let Some(group) = app.config.groups.get(index) {
-            app.drag = Some(Drag { index, cursor, x: group.x, y: group.y, moved: false });
+            app.drag = Some(Drag { index, cursor, start: Frame::of(group), resize, moved: false });
         }
     });
     let snapshot = take_snapshot();
@@ -370,6 +399,7 @@ pub fn begin_drag(index: usize) {
 pub fn drag_to_cursor() {
     let mut cursor = POINT::default();
     unsafe { _ = GetCursorPos(&mut cursor) };
+    let grid = SNAPSHOT.with(|cell| cell.try_borrow().ok().and_then(|s| s.as_ref().map(|s| s.grid)));
     let moved = with_app(|app| {
         let drag = app.drag.as_mut()?;
         let (dx, dy) = (cursor.x - drag.cursor.x, cursor.y - drag.cursor.y);
@@ -377,13 +407,24 @@ pub fn drag_to_cursor() {
             return None;
         }
         drag.moved = true;
-        let (index, x, y) = (drag.index, drag.x + dx, drag.y + dy);
+        let (index, start) = (drag.index, drag.start);
+        let fitted = match drag.resize {
+            None => {
+                let target = Frame { x: start.x + dx, y: start.y + dy, ..start };
+                layout::fit_group(target, grid, desktop::work_area(cursor))
+            }
+            Some((right, bottom)) => {
+                let width = start.width + if right { dx } else { 0 };
+                let height = start.height + if bottom { dy } else { 0 };
+                let area = desktop::work_area(POINT { x: start.x, y: start.y });
+                layout::resize_group(Frame { width, height, ..start }, grid, area)
+            }
+        };
         let group = app.config.groups.get_mut(index)?;
-        if (group.x, group.y) == (x, y) {
+        if Frame::of(group) == fitted {
             return None;
         }
-        group.x = x;
-        group.y = y;
+        fitted.apply(group);
         let group = group.clone();
         let windows = *app.windows.iter().find(|w| w.index == index)?;
         Some((windows, group, app.layout_groups()))
@@ -394,11 +435,11 @@ pub fn drag_to_cursor() {
     SNAPSHOT.with(|cell| {
         let Ok(mut snapshot) = cell.try_borrow_mut() else { return };
         let Some(snapshot) = snapshot.as_mut() else { return };
-        let origin = snapshot.grid.content_origin(&group);
-        if snapshot.applied == Some(origin) {
+        let frame = Frame::of(&group);
+        if snapshot.applied == Some(frame) {
             return;
         }
-        snapshot.applied = Some(origin);
+        snapshot.applied = Some(frame);
         DESKTOP.with(|desktop| {
             if let Ok(desktop) = desktop.try_borrow() {
                 if let Some(desktop) = desktop.as_ref() {
@@ -424,7 +465,7 @@ pub fn end_drag() {
             _ = config.save();
             layout_icons();
         }
-        Some(Some((drag, _))) => toggle_collapsed(drag.index),
+        Some(Some((drag, _))) if drag.resize.is_none() => toggle_collapsed(drag.index),
         _ => {}
     }
 }
@@ -499,6 +540,7 @@ fn reload_config() {
     with_app(|app| app.config = config);
     match handles() {
         Some((host, def_view, _)) => {
+            fit_groups();
             rebuild_windows(host, def_view);
             layout_icons();
         }

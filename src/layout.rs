@@ -43,8 +43,93 @@ impl Grid {
     }
 
     pub fn content_origin(&self, group: &Group) -> POINT {
-        self.snap_up(POINT { x: group.x + PADDING, y: group.y + HEADER_HEIGHT + PADDING })
+        self.snap_up(POINT { x: group.x, y: group.y + HEADER_HEIGHT + PADDING })
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Frame {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Frame {
+    pub fn of(group: &Group) -> Frame {
+        Frame { x: group.x, y: group.y, width: group.width, height: group.height }
+    }
+
+    pub fn apply(&self, group: &mut Group) {
+        (group.x, group.y, group.width, group.height) = (self.x, self.y, self.width, self.height);
+    }
+}
+
+struct Cells {
+    first: POINT,
+    columns: i32,
+    rows: i32,
+    spacing: POINT,
+}
+
+impl Cells {
+    fn of(grid: Grid, area: RECT) -> Cells {
+        let first = grid.snap_up(POINT { x: area.left, y: area.top });
+        let spacing = grid.spacing;
+        let columns = ((area.right - first.x) / spacing.x).max(1);
+        let rows = ((area.bottom - first.y) / spacing.y).max(1);
+        Cells { first, columns, rows, spacing }
+    }
+
+    fn span(&self, width: i32, height: i32) -> (i32, i32) {
+        let n = ((width + self.spacing.x / 2) / self.spacing.x).clamp(1, self.columns);
+        let m = ((height + self.spacing.y / 2) / self.spacing.y).clamp(1, self.rows);
+        (n, m)
+    }
+
+    fn cell_at(&self, x: i32, y: i32) -> (i32, i32) {
+        let col = (x - self.first.x + self.spacing.x / 2).div_euclid(self.spacing.x);
+        let row = (y - self.first.y + self.spacing.y / 2).div_euclid(self.spacing.y);
+        (col, row)
+    }
+
+    fn frame(&self, col: i32, row: i32, n: i32, m: i32) -> Frame {
+        Frame {
+            x: self.first.x + col * self.spacing.x,
+            y: self.first.y + row * self.spacing.y,
+            width: n * self.spacing.x,
+            height: m * self.spacing.y,
+        }
+    }
+}
+
+fn clamp_free(frame: Frame, area: RECT) -> Frame {
+    let width = frame.width.min(area.right - area.left).max(1);
+    let height = frame.height.min(area.bottom - area.top).max(1);
+    let x = frame.x.clamp(area.left, area.right - width);
+    let y = frame.y.clamp(area.top, area.bottom - height);
+    Frame { x, y, width, height }
+}
+
+pub fn fit_group(frame: Frame, grid: Option<Grid>, area: RECT) -> Frame {
+    let Some(grid) = grid else { return clamp_free(frame, area) };
+    let cells = Cells::of(grid, area);
+    let (n, m) = cells.span(frame.width, frame.height);
+    let (col, row) = cells.cell_at(frame.x, frame.y);
+    cells.frame(col.clamp(0, cells.columns - n), row.clamp(0, cells.rows - m), n, m)
+}
+
+pub fn resize_group(frame: Frame, grid: Option<Grid>, area: RECT) -> Frame {
+    let Some(grid) = grid else {
+        let width = frame.width.clamp(1, area.right - frame.x);
+        let height = frame.height.clamp(HEADER_HEIGHT, area.bottom - frame.y);
+        return Frame { width, height, ..frame };
+    };
+    let cells = Cells::of(grid, area);
+    let (col, row) = cells.cell_at(frame.x, frame.y);
+    let (col, row) = (col.clamp(0, cells.columns - 1), row.clamp(0, cells.rows - 1));
+    let (n, m) = cells.span(frame.width, frame.height);
+    cells.frame(col, row, n.min(cells.columns - col), m.min(cells.rows - row))
 }
 
 pub fn plan(icons: &[Icon], groups: &[Group], grid: Grid, work_area: impl Fn(POINT) -> RECT) -> Vec<(usize, POINT)> {
@@ -62,7 +147,7 @@ pub fn plan(icons: &[Icon], groups: &[Group], grid: Grid, work_area: impl Fn(POI
     for ((group, mut list), bounds) in groups.iter().zip(members).zip(group_rects.iter_mut()) {
         list.sort_by_key(|&i| icons[i].name.to_lowercase());
         if group.collapsed {
-            let stack = grid.snap_down(POINT { x: group.x + PADDING, y: group.y });
+            let stack = grid.snap_down(POINT { x: group.x, y: group.y });
             if !list.is_empty() {
                 let stack_cell = cell(stack, spacing);
                 bounds.left = bounds.left.min(stack_cell.left);
@@ -75,7 +160,7 @@ pub fn plan(icons: &[Icon], groups: &[Group], grid: Grid, work_area: impl Fn(POI
             continue;
         }
         let start = grid.content_origin(group);
-        let cols = ((group.x + group.width - PADDING - start.x) / spacing.x).max(1);
+        let cols = ((group.x + group.width - start.x) / spacing.x).max(1);
         for (n, i) in list.into_iter().enumerate() {
             let (col, row) = (n as i32 % cols, n as i32 / cols);
             let target = POINT { x: start.x + col * spacing.x, y: start.y + row * spacing.y };
@@ -245,6 +330,51 @@ mod tests {
         assert!(moves.iter().all(|(i, _)| *i < 2));
         assert_eq!(moves[0].1, moves[1].1);
         assert!(moves[0].1.y <= 300 && moves[0].1.y + SPACING.y > 300);
+    }
+
+    fn frame(x: i32, y: i32, width: i32, height: i32) -> Frame {
+        Frame { x, y, width, height }
+    }
+
+    fn on_cells(f: Frame) -> bool {
+        on_grid(POINT { x: f.x, y: f.y }) && f.width % SPACING.x == 0 && f.height % SPACING.y == 0
+    }
+
+    #[test]
+    fn fitted_group_covers_whole_cells() {
+        let f = fit_group(frame(523, 291, 420, 260), Some(GRID), SCREEN);
+        assert!(on_cells(f), "{f:?}");
+        assert_eq!((f.width, f.height), (6 * SPACING.x, 3 * SPACING.y));
+        assert!((f.x - 523).abs() <= SPACING.x / 2 && (f.y - 291).abs() <= SPACING.y / 2);
+        let g = Group { x: f.x, y: f.y, ..group(&[]) };
+        assert_eq!(GRID.content_origin(&g).x, f.x);
+    }
+
+    #[test]
+    fn fitted_group_reaches_the_outer_cells_but_not_beyond() {
+        let last_x = GRID.origin.x + (SCREEN.right - GRID.origin.x) / SPACING.x * SPACING.x;
+        let last_y = GRID.origin.y + (SCREEN.bottom - GRID.origin.y) / SPACING.y * SPACING.y;
+        let f = fit_group(frame(5000, 5000, 400, 300), Some(GRID), SCREEN);
+        assert!(on_cells(f));
+        assert_eq!((f.x + f.width, f.y + f.height), (last_x, last_y));
+        let f = fit_group(frame(-500, -500, 400, 300), Some(GRID), SCREEN);
+        assert_eq!((f.x, f.y), (GRID.origin.x, GRID.origin.y));
+        let f = fit_group(frame(100, 100, 40000, 300), Some(GRID), SCREEN);
+        assert_eq!((f.x, f.x + f.width), (GRID.origin.x, last_x));
+        let f = fit_group(frame(-50, 2000, 400, 300), None, SCREEN);
+        assert_eq!((f.x, f.y), (0, 740));
+    }
+
+    #[test]
+    fn resize_keeps_the_corner_and_steps_by_cells() {
+        let start = fit_group(frame(500, 300, 400, 300), Some(GRID), SCREEN);
+        let wider = resize_group(Frame { width: start.width + 50, ..start }, Some(GRID), SCREEN);
+        assert_eq!((wider.x, wider.y, wider.width), (start.x, start.y, start.width + SPACING.x));
+        let tiny = resize_group(Frame { width: 3, height: -40, ..start }, Some(GRID), SCREEN);
+        assert_eq!((tiny.x, tiny.y, tiny.width, tiny.height), (start.x, start.y, SPACING.x, SPACING.y));
+        let huge = resize_group(Frame { width: 9000, height: 9000, ..start }, Some(GRID), SCREEN);
+        assert!(on_cells(huge) && huge.x + huge.width <= SCREEN.right && huge.y + huge.height <= SCREEN.bottom);
+        assert_eq!((huge.x, huge.y), (start.x, start.y));
     }
 
     #[test]

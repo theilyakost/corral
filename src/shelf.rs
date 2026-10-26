@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -78,15 +78,21 @@ struct Metrics {
     scale: f32,
     columns: usize,
     cell_width: f32,
+    cell_height: f32,
 }
 
 thread_local! {
     static SHELVES: RefCell<HashMap<isize, Shelf>> = RefCell::new(HashMap::new());
     static GRAPHICS: RefCell<Option<Graphics>> = const { RefCell::new(None) };
+    static SPACING: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
 }
 
 fn with_shelf<R>(hwnd: HWND, f: impl FnOnce(&mut Shelf) -> R) -> Option<R> {
     SHELVES.with(|cell| cell.try_borrow_mut().ok()?.get_mut(&(hwnd.0 as isize)).map(f))
+}
+
+pub fn set_spacing(spacing: POINT) {
+    SPACING.with(|cell| cell.set(Some((spacing.x, spacing.y))));
 }
 
 pub fn register(body: HWND, glass: HWND) {
@@ -134,24 +140,26 @@ fn load_icons(body: HWND, pixels: i32) {
 fn metrics(hwnd: HWND, width: f32) -> Metrics {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
-    let inner = (width - 2.0 * PADDING * scale).max(0.0);
-    let columns = ((inner / (CELL_WIDTH * scale)).floor() as usize).max(1);
-    let cell_width = (inner / columns as f32).max(CELL_WIDTH * scale);
-    Metrics { scale, columns, cell_width }
+    let (step_x, cell_height) = SPACING
+        .with(|cell| cell.get())
+        .map_or((CELL_WIDTH * scale, CELL_HEIGHT * scale), |(x, y)| (x as f32, y as f32));
+    let columns = ((width / step_x).round() as usize).max(1);
+    let cell_width = width.max(step_x) / columns as f32;
+    Metrics { scale, columns, cell_width, cell_height }
 }
 
 impl Metrics {
     fn cell(&self, index: usize, scroll: f32) -> D2D_RECT_F {
         let (col, row) = ((index % self.columns) as f32, (index / self.columns) as f32);
-        let (w, h) = (self.cell_width, CELL_HEIGHT * self.scale);
-        let left = PADDING * self.scale + col * w;
+        let (w, h) = (self.cell_width, self.cell_height);
+        let left = col * w;
         let top = PADDING * self.scale + row * h - scroll;
         D2D_RECT_F { left, top, right: left + w, bottom: top + h }
     }
 
     fn content_height(&self, count: usize) -> f32 {
         let rows = count.div_ceil(self.columns) as f32;
-        rows * CELL_HEIGHT * self.scale + 2.0 * PADDING * self.scale
+        rows * self.cell_height + 2.0 * PADDING * self.scale
     }
 
     fn icon_pixels(&self) -> i32 {
@@ -368,6 +376,9 @@ fn entry(hwnd: HWND, index: usize) -> Option<(String, IShellItem)> {
 
 pub unsafe extern "system" fn shelf_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        if let Some(result) = crate::group::grip_message(hwnd, msg, lparam) {
+            return result;
+        }
         if matches!(msg, WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR) {
             if let Some(result) = shell::forward_menu_message(msg, wparam, lparam) {
                 return result;
@@ -430,10 +441,10 @@ pub unsafe extern "system" fn shelf_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
-                let scale = metrics(hwnd, client_size(hwnd).0 as f32).scale;
+                let step = metrics(hwnd, client_size(hwnd).0 as f32).cell_height;
                 set_state(hwnd, |shelf| {
                     let before = shelf.scroll;
-                    shelf.scroll = (shelf.scroll - delta * CELL_HEIGHT * scale).max(0.0);
+                    shelf.scroll = (shelf.scroll - delta * step).max(0.0);
                     shelf.scroll != before
                 });
                 LRESULT(0)

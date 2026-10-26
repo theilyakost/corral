@@ -5,10 +5,11 @@ use windows::Win32::Graphics::Gdi::{
     FW_SEMIBOLD, FillRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode,
     SetTextColor, TRANSPARENT,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW,
-    GetWindowTextW, HTTRANSPARENT, HWND_TOP, IDC_ARROW, IDC_SIZEALL, LWA_ALPHA, LoadCursorW,
+    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect, GetCursorPos,
+    GetWindowLongPtrW, GetWindowTextW, HTCLIENT, HTTRANSPARENT, HWND_TOP, IDC_ARROW, IDC_SIZEALL, IDC_SIZENS,
+    IDC_SIZENWSE, IDC_SIZEWE, LWA_ALPHA, LoadCursorW,
     MA_NOACTIVATE, RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetCursor, SetLayeredWindowAttributes,
     SetWindowTextW, ShowWindow,
     LWA_COLORKEY, SetWindowLongPtrW, SetWindowPos, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
@@ -25,6 +26,7 @@ const BODY_ALPHA: u8 = 110;
 const HEADER_COLOR: u32 = 0x00201C1A;
 pub const BODY_COLOR: u32 = 0x00141210;
 const TEXT_COLOR: u32 = 0x00F0F0F0;
+const GRIP: i32 = 8;
 
 #[derive(Clone, Copy)]
 pub struct GroupWindows {
@@ -204,14 +206,72 @@ unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
     }
 }
 
+fn grip_at(hwnd: HWND, point: POINT) -> Option<(bool, bool)> {
+    let mut rect = RECT::default();
+    unsafe { _ = GetClientRect(hwnd, &mut rect) };
+    let right = point.x >= rect.right - GRIP;
+    let bottom = point.y >= rect.bottom - GRIP;
+    (right || bottom).then_some((right, bottom))
+}
+
+fn grip_under_cursor(hwnd: HWND) -> Option<(bool, bool)> {
+    let mut point = POINT::default();
+    unsafe {
+        _ = GetCursorPos(&mut point);
+        _ = ScreenToClient(hwnd, &mut point);
+    }
+    grip_at(hwnd, point)
+}
+
+pub unsafe fn grip_message(hwnd: HWND, msg: u32, lparam: LPARAM) -> Option<LRESULT> {
+    unsafe {
+        let captured = GetCapture() == hwnd;
+        match msg {
+            WM_SETCURSOR => {
+                let cursor = match grip_under_cursor(hwnd)? {
+                    (true, true) => IDC_SIZENWSE,
+                    (true, false) => IDC_SIZEWE,
+                    _ => IDC_SIZENS,
+                };
+                SetCursor(LoadCursorW(None, cursor).ok());
+                Some(LRESULT(1))
+            }
+            WM_LBUTTONDOWN => {
+                let point = POINT { x: (lparam.0 & 0xFFFF) as i16 as i32, y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 };
+                let (right, bottom) = grip_at(hwnd, point)?;
+                crate::begin_resize(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize, right, bottom);
+                SetCapture(hwnd);
+                Some(LRESULT(0))
+            }
+            WM_MOUSEMOVE if captured => {
+                crate::drag_to_cursor();
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONUP if captured => {
+                _ = ReleaseCapture();
+                Some(LRESULT(0))
+            }
+            WM_CAPTURECHANGED => {
+                crate::end_drag();
+                Some(LRESULT(0))
+            }
+            _ => None,
+        }
+    }
+}
+
 unsafe extern "system" fn body_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        if let Some(result) = grip_message(hwnd, msg, lparam) {
+            return result;
+        }
         match msg {
             WM_PAINT => {
                 paint(hwnd, BODY_COLOR, false);
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
+            WM_NCHITTEST if grip_under_cursor(hwnd).is_some() => LRESULT(HTCLIENT as isize),
             WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
