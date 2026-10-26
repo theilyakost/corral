@@ -24,9 +24,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, w};
 
 use config::{Config, Group};
-use desktop::Desktop;
+use desktop::{Desktop, DesktopItem};
 use group::GroupWindows;
-use layout::Icon;
+use layout::{Grid, Icon};
 
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_DESKTOP_CHANGED: u32 = WM_APP + 2;
@@ -35,6 +35,7 @@ const TIMER_ATTACH: usize = 2;
 const CMD_OPEN_CONFIG: usize = 1;
 const CMD_RELOAD: usize = 2;
 const CMD_EXIT: usize = 3;
+const MAX_RETRIES: u32 = 3;
 
 struct App {
     main: HWND,
@@ -42,6 +43,13 @@ struct App {
     config: Config,
     windows: Vec<GroupWindows>,
     drag: Option<Drag>,
+    retries: u32,
+}
+
+struct Snapshot {
+    items: Vec<DesktopItem>,
+    grid: Grid,
+    applied: Option<POINT>,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +63,7 @@ struct Drag {
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     static DESKTOP: RefCell<Option<Desktop>> = const { RefCell::new(None) };
+    static SNAPSHOT: RefCell<Option<Snapshot>> = const { RefCell::new(None) };
 }
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -106,7 +115,7 @@ fn main() {
         };
 
         APP.with(|cell| {
-            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None });
+            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0 });
         });
         add_tray_icon(main);
         watcher::watch_desktop(main, WM_APP_DESKTOP_CHANGED);
@@ -164,12 +173,24 @@ fn layout_icons() {
         return schedule(TIMER_LAYOUT, 200);
     };
     let result = DESKTOP.with(|cell| match cell.try_borrow() {
-        Ok(desktop) => desktop.as_ref().map(|d| arrange(d, &groups)),
-        Err(_) => Some(Ok(false)),
+        Ok(desktop) => desktop.as_ref().map(|d| arrange(d, &groups).map(Some)),
+        Err(_) => Some(Ok(None)),
     });
     match result {
-        Some(Ok(true)) | None => {}
-        Some(Ok(false)) => schedule(TIMER_LAYOUT, 200),
+        None => {}
+        Some(Ok(None)) => schedule(TIMER_LAYOUT, 200),
+        Some(Ok(Some(0))) => _ = with_app(|app| app.retries = 0),
+        Some(Ok(Some(_))) => {
+            let retry = with_app(|app| {
+                app.retries += 1;
+                app.retries <= MAX_RETRIES
+            });
+            if retry == Some(true) {
+                schedule(TIMER_LAYOUT, 600);
+            } else {
+                with_app(|app| app.retries = 0);
+            }
+        }
         Some(Err(_)) => {
             detach();
             schedule(TIMER_ATTACH, 1500);
@@ -177,14 +198,31 @@ fn layout_icons() {
     }
 }
 
-fn arrange(desktop: &Desktop, groups: &[Group]) -> windows::core::Result<bool> {
-    let items = desktop.items()?;
-    let spacing = desktop.spacing()?;
+fn arrange(desktop: &Desktop, groups: &[Group]) -> windows::core::Result<usize> {
+    let mut items = desktop.items()?;
+    let grid = Grid::detect(items.iter().map(|i| i.position), desktop.spacing()?);
+    apply(desktop, &mut items, grid, groups)
+}
+
+fn apply(desktop: &Desktop, items: &mut [DesktopItem], grid: Grid, groups: &[Group]) -> windows::core::Result<usize> {
     let icons: Vec<Icon> = items.iter().map(|i| Icon { name: &i.name, position: i.position }).collect();
-    for (i, target) in layout::plan(&icons, groups, spacing, desktop::work_area) {
-        desktop.move_item(items[i].index, target);
+    let moves = layout::plan(&icons, groups, grid, desktop::work_area);
+    let batch: Vec<(&DesktopItem, POINT)> = moves.iter().map(|&(i, target)| (&items[i], target)).collect();
+    desktop.position(&batch)?;
+    for &(i, target) in &moves {
+        items[i].position = target;
     }
-    Ok(true)
+    Ok(moves.len())
+}
+
+fn take_snapshot() -> Option<Snapshot> {
+    DESKTOP.with(|cell| {
+        let desktop = cell.try_borrow().ok()?;
+        let desktop = desktop.as_ref()?;
+        let items = desktop.items().ok()?;
+        let grid = Grid::detect(items.iter().map(|i| i.position), desktop.spacing().ok()?);
+        Some(Snapshot { items, grid, applied: None })
+    })
 }
 
 pub fn begin_drag(index: usize) {
@@ -193,6 +231,12 @@ pub fn begin_drag(index: usize) {
     with_app(|app| {
         if let Some(group) = app.config.groups.get(index) {
             app.drag = Some(Drag { index, cursor, x: group.x, y: group.y });
+        }
+    });
+    let snapshot = take_snapshot();
+    SNAPSHOT.with(|cell| {
+        if let Ok(mut current) = cell.try_borrow_mut() {
+            *current = snapshot;
         }
     });
 }
@@ -210,16 +254,40 @@ pub fn drag_to_cursor() {
         group.x = x;
         group.y = y;
         let windows = *app.windows.iter().find(|w| w.index == drag.index)?;
-        Some((windows, group.clone()))
+        Some((windows, group.clone(), app.config.groups.clone()))
     });
-    if let Some(Some((windows, group))) = moved {
-        windows.place(&group);
-        layout_icons();
-    }
+    let Some(Some((windows, group, groups))) = moved else { return };
+    windows.place(&group);
+
+    SNAPSHOT.with(|cell| {
+        let Ok(mut snapshot) = cell.try_borrow_mut() else { return };
+        let Some(snapshot) = snapshot.as_mut() else { return };
+        let origin = snapshot.grid.content_origin(&group);
+        if snapshot.applied == Some(origin) {
+            return;
+        }
+        snapshot.applied = Some(origin);
+        DESKTOP.with(|desktop| {
+            if let Ok(desktop) = desktop.try_borrow() {
+                if let Some(desktop) = desktop.as_ref() {
+                    _ = apply(desktop, &mut snapshot.items, snapshot.grid, &groups);
+                }
+            }
+        });
+    });
 }
 
 pub fn end_drag() {
-    if let Some(Some(config)) = with_app(|app| app.drag.take().map(|_| app.config.clone())) {
+    SNAPSHOT.with(|cell| {
+        if let Ok(mut snapshot) = cell.try_borrow_mut() {
+            *snapshot = None;
+        }
+    });
+    let config = with_app(|app| {
+        app.retries = 0;
+        app.drag.take().map(|_| app.config.clone())
+    });
+    if let Some(Some(config)) = config {
         _ = config.save();
         layout_icons();
     }
@@ -293,6 +361,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     unsafe {
         match msg {
             WM_APP_DESKTOP_CHANGED => {
+                with_app(|app| app.retries = 0);
                 SetTimer(Some(hwnd), TIMER_LAYOUT, 400, None);
                 LRESULT(0)
             }

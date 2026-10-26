@@ -1,4 +1,4 @@
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, ScreenToClient,
 };
@@ -6,14 +6,12 @@ use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, I
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Shell::Common::{ITEMIDLIST, STRRET};
 use windows::Win32::UI::Shell::{
-    CSIDL_DESKTOP, FWF_AUTOARRANGE, FWF_SNAPTOGRID, IFolderView2, IShellBrowser, IShellFolder, IShellWindows,
-    SHGDN_FORPARSING, SHGDN_INFOLDER, SHGDNF, SID_STopLevelBrowser, SVGIO_ALLVIEW, SWC_DESKTOP, SWFO_NEEDDISPATCH,
-    ShellWindows, StrRetToStrW,
+    CSIDL_DESKTOP, FWF_AUTOARRANGE, IFolderView2, IShellBrowser, IShellFolder, IShellWindows, SHGDN_FORPARSING,
+    SHGDN_INFOLDER, SHGDNF, SID_STopLevelBrowser, SVGIO_ALLVIEW, SVSI_POSITIONITEM, SWC_DESKTOP,
+    SWFO_NEEDDISPATCH, ShellWindows, StrRetToStrW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetParent, SendMessageW};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetParent};
 use windows::core::{Interface, PWSTR, Result, w};
-
-const LVM_SETITEMPOSITION: u32 = 0x100F;
 
 pub struct Desktop {
     view: IFolderView2,
@@ -25,8 +23,14 @@ pub struct Desktop {
 
 pub struct DesktopItem {
     pub name: String,
-    pub index: i32,
     pub position: POINT,
+    pidl: *mut ITEMIDLIST,
+}
+
+impl Drop for DesktopItem {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.pidl as _)) };
+    }
 }
 
 impl Desktop {
@@ -50,7 +54,7 @@ impl Desktop {
     }
 
     pub fn disable_auto_arrange(&self) -> Result<()> {
-        let mask = (FWF_AUTOARRANGE.0 | FWF_SNAPTOGRID.0) as u32;
+        let mask = FWF_AUTOARRANGE.0 as u32;
         unsafe {
             if self.view.GetCurrentFolderFlags()? & mask != 0 {
                 self.view.SetCurrentFolderFlags(mask, 0)?;
@@ -71,13 +75,14 @@ impl Desktop {
             let count = self.view.ItemCount(SVGIO_ALLVIEW)?;
             for index in 0..count {
                 let Ok(pidl) = self.view.Item(index) else { continue };
-                let name = self.display_name(pidl);
-                let position = self.view.GetItemPosition(pidl);
-                CoTaskMemFree(Some(pidl as _));
-                if let (Ok(name), Ok(mut position)) = (name, position) {
-                    _ = ClientToScreen(self.list_view, &mut position);
-                    items.push(DesktopItem { name, index, position });
-                }
+                let mut item = DesktopItem { name: String::new(), position: POINT::default(), pidl };
+                let (Ok(name), Ok(mut position)) = (self.display_name(pidl), self.view.GetItemPosition(pidl)) else {
+                    continue;
+                };
+                _ = ClientToScreen(self.list_view, &mut position);
+                item.name = name;
+                item.position = position;
+                items.push(item);
             }
         }
         Ok(items)
@@ -96,17 +101,26 @@ impl Desktop {
         }
     }
 
-    pub fn move_item(&self, index: i32, screen: POINT) {
-        let mut point = screen;
+    pub fn position(&self, moves: &[(&DesktopItem, POINT)]) -> Result<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let pidls: Vec<*const ITEMIDLIST> = moves.iter().map(|(item, _)| item.pidl as *const _).collect();
+        let points: Vec<POINT> = moves
+            .iter()
+            .map(|&(_, screen)| {
+                let mut point = screen;
+                unsafe { _ = ScreenToClient(self.list_view, &mut point) };
+                point
+            })
+            .collect();
         unsafe {
-            _ = ScreenToClient(self.list_view, &mut point);
-            let packed = ((point.y & 0xFFFF) << 16) | (point.x & 0xFFFF);
-            SendMessageW(
-                self.list_view,
-                LVM_SETITEMPOSITION,
-                Some(WPARAM(index as usize)),
-                Some(LPARAM(packed as isize)),
-            );
+            self.view.SelectAndPositionItems(
+                pidls.len() as u32,
+                pidls.as_ptr(),
+                Some(points.as_ptr()),
+                SVSI_POSITIONITEM.0 as u32,
+            )
         }
     }
 }
