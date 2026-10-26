@@ -9,7 +9,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW,
     GetWindowTextW, HTTRANSPARENT, HWND_TOP, IDC_ARROW, IDC_SIZEALL, LWA_ALPHA, LoadCursorW,
-    MA_NOACTIVATE, RegisterClassW, SWP_NOACTIVATE, SetCursor, SetLayeredWindowAttributes,
+    MA_NOACTIVATE, RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetCursor, SetLayeredWindowAttributes,
+    SetWindowTextW, ShowWindow,
     LWA_COLORKEY, SetWindowLongPtrW, SetWindowPos, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_CHILD,
     WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT, WS_VISIBLE,
@@ -111,6 +112,9 @@ impl GroupWindows {
             };
             let windows = GroupWindows { index, header, body, glass, host, def_view };
             windows.place(group);
+            if owned {
+                windows.set_collapsed(group, group.collapsed);
+            }
             Ok(windows)
         }
     }
@@ -135,6 +139,22 @@ impl GroupWindows {
                 SWP_NOACTIVATE,
             );
         }
+    }
+
+    pub fn set_open(&self, open: bool) {
+        let command = if open { SW_SHOWNA } else { SW_HIDE };
+        unsafe {
+            _ = ShowWindow(self.body, command);
+            if let Some(glass) = self.glass {
+                _ = ShowWindow(glass, command);
+            }
+        }
+    }
+
+    pub fn set_collapsed(&self, group: &Group, collapsed: bool) {
+        self.set_open(!collapsed);
+        let marker = if collapsed { "▸" } else { "▾" };
+        unsafe { _ = SetWindowTextW(self.header, &HSTRING::from(format!("{marker}  {}", group.name))) };
     }
 
     pub fn destroy(&self) {
@@ -167,6 +187,7 @@ unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
+                crate::hover_header(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize);
                 crate::drag_to_cursor();
                 LRESULT(0)
             }

@@ -39,6 +39,8 @@ const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_DESKTOP_CHANGED: u32 = WM_APP + 2;
 const TIMER_LAYOUT: usize = 1;
 const TIMER_ATTACH: usize = 2;
+const TIMER_PEEK: usize = 3;
+const DRAG_THRESHOLD: i32 = 4;
 const CMD_OPEN_CONFIG: usize = 1;
 const CMD_RELOAD: usize = 2;
 const CMD_EXIT: usize = 3;
@@ -54,6 +56,17 @@ struct App {
     drag: Option<Drag>,
     retries: u32,
     agent: Option<Agent>,
+    peek: Option<usize>,
+}
+
+impl App {
+    fn layout_groups(&self) -> Vec<Group> {
+        let mut groups = self.config.groups.clone();
+        if self.agent.is_none() {
+            groups.iter_mut().for_each(|g| g.collapsed = false);
+        }
+        groups
+    }
 }
 
 struct Arranged {
@@ -73,6 +86,7 @@ struct Drag {
     cursor: POINT,
     x: i32,
     y: i32,
+    moved: bool,
 }
 
 thread_local! {
@@ -134,7 +148,7 @@ fn main() {
         };
 
         APP.with(|cell| {
-            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0, agent: None });
+            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0, agent: None, peek: None });
         });
         add_tray_icon(main);
         watcher::watch_desktop(main, WM_APP_DESKTOP_CHANGED);
@@ -208,6 +222,7 @@ fn detach() {
 
 fn rebuild_windows(host: HWND, def_view: HWND) {
     let Some((old, groups, instance, owned)) = with_app(|app| {
+        app.peek = None;
         (std::mem::take(&mut app.windows), app.config.groups.clone(), app.instance, app.agent.is_some())
     }) else {
         return;
@@ -225,7 +240,7 @@ fn rebuild_windows(host: HWND, def_view: HWND) {
 
 fn layout_icons() {
     check_agent();
-    let Some((groups, owned)) = with_app(|app| (app.config.groups.clone(), app.agent.is_some())) else {
+    let Some((groups, owned)) = with_app(|app| (app.layout_groups(), app.agent.is_some())) else {
         return schedule(TIMER_LAYOUT, 200);
     };
     let result = DESKTOP.with(|cell| match cell.try_borrow() {
@@ -341,7 +356,7 @@ pub fn begin_drag(index: usize) {
     unsafe { _ = GetCursorPos(&mut cursor) };
     with_app(|app| {
         if let Some(group) = app.config.groups.get(index) {
-            app.drag = Some(Drag { index, cursor, x: group.x, y: group.y });
+            app.drag = Some(Drag { index, cursor, x: group.x, y: group.y, moved: false });
         }
     });
     let snapshot = take_snapshot();
@@ -356,16 +371,22 @@ pub fn drag_to_cursor() {
     let mut cursor = POINT::default();
     unsafe { _ = GetCursorPos(&mut cursor) };
     let moved = with_app(|app| {
-        let drag = app.drag?;
-        let group = app.config.groups.get_mut(drag.index)?;
-        let (x, y) = (drag.x + cursor.x - drag.cursor.x, drag.y + cursor.y - drag.cursor.y);
+        let drag = app.drag.as_mut()?;
+        let (dx, dy) = (cursor.x - drag.cursor.x, cursor.y - drag.cursor.y);
+        if !drag.moved && dx.abs() < DRAG_THRESHOLD && dy.abs() < DRAG_THRESHOLD {
+            return None;
+        }
+        drag.moved = true;
+        let (index, x, y) = (drag.index, drag.x + dx, drag.y + dy);
+        let group = app.config.groups.get_mut(index)?;
         if (group.x, group.y) == (x, y) {
             return None;
         }
         group.x = x;
         group.y = y;
-        let windows = *app.windows.iter().find(|w| w.index == drag.index)?;
-        Some((windows, group.clone(), app.config.groups.clone()))
+        let group = group.clone();
+        let windows = *app.windows.iter().find(|w| w.index == index)?;
+        Some((windows, group, app.layout_groups()))
     });
     let Some(Some((windows, group, groups))) = moved else { return };
     windows.place(&group);
@@ -394,13 +415,79 @@ pub fn end_drag() {
             *snapshot = None;
         }
     });
-    let config = with_app(|app| {
+    let finished = with_app(|app| {
         app.retries = 0;
-        app.drag.take().map(|_| app.config.clone())
+        app.drag.take().map(|drag| (drag, app.config.clone()))
     });
-    if let Some(Some(config)) = config {
-        _ = config.save();
-        layout_icons();
+    match finished {
+        Some(Some((drag, config))) if drag.moved => {
+            _ = config.save();
+            layout_icons();
+        }
+        Some(Some((drag, _))) => toggle_collapsed(drag.index),
+        _ => {}
+    }
+}
+
+fn toggle_collapsed(index: usize) {
+    let changed = with_app(|app| {
+        app.agent.as_ref()?;
+        let group = app.config.groups.get_mut(index)?;
+        group.collapsed = !group.collapsed;
+        let group = group.clone();
+        let windows = *app.windows.iter().find(|w| w.index == index)?;
+        app.peek = group.collapsed.then_some(index);
+        Some((windows, group, app.config.clone()))
+    });
+    let Some(Some((windows, group, config))) = changed else { return };
+    windows.set_collapsed(&group, group.collapsed);
+    if group.collapsed {
+        schedule(TIMER_PEEK, 150);
+    }
+    _ = config.save();
+    layout_icons();
+}
+
+pub fn hover_header(index: usize) {
+    let opened = with_app(|app| {
+        let collapsed = app.agent.is_some() && app.config.groups.get(index).is_some_and(|g| g.collapsed);
+        if !collapsed || app.drag.is_some() || app.peek == Some(index) {
+            return None;
+        }
+        let previous = app.peek.and_then(|p| app.windows.iter().find(|w| w.index == p).copied());
+        app.peek = Some(index);
+        let windows = *app.windows.iter().find(|w| w.index == index)?;
+        Some((previous, windows))
+    });
+    let Some(Some((previous, windows))) = opened else { return };
+    if let Some(previous) = previous {
+        previous.set_open(false);
+    }
+    windows.set_open(true);
+    schedule(TIMER_PEEK, 150);
+}
+
+fn check_peek() {
+    let mut cursor = POINT::default();
+    unsafe { _ = GetCursorPos(&mut cursor) };
+    let busy = shell::menu_open();
+    let closed = with_app(|app| {
+        let index = app.peek?;
+        let group = app.config.groups.get(index)?;
+        let inside = cursor.x >= group.x
+            && cursor.x < group.x + group.width
+            && cursor.y >= group.y
+            && cursor.y < group.y + group.height;
+        if busy || inside || app.drag.is_some() {
+            return Some(None);
+        }
+        app.peek = None;
+        Some(app.windows.iter().find(|w| w.index == index).copied())
+    });
+    match closed {
+        Some(Some(Some(windows))) => windows.set_open(false),
+        Some(Some(None)) => schedule(TIMER_PEEK, 150),
+        _ => {}
     }
 }
 
@@ -481,6 +568,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 match wparam.0 {
                     TIMER_LAYOUT => layout_icons(),
                     TIMER_ATTACH => attach(),
+                    TIMER_PEEK => check_peek(),
                     _ => {}
                 }
                 LRESULT(0)

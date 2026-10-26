@@ -113,6 +113,10 @@ pub fn context_menu(owner: HWND, item: &IShellItem, extra: &str, at: POINT) -> O
     }
 }
 
+pub fn menu_open() -> bool {
+    ACTIVE_MENU.with(|m| m.try_borrow().map_or(true, |m| m.is_some()))
+}
+
 pub fn forward_menu_message(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     let menu = ACTIVE_MENU.with(|m| m.borrow().clone())?;
     unsafe {

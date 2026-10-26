@@ -37,6 +37,11 @@ impl Grid {
         POINT { x: up(p.x, self.origin.x, self.spacing.x), y: up(p.y, self.origin.y, self.spacing.y) }
     }
 
+    fn snap_down(&self, p: POINT) -> POINT {
+        let down = |v: i32, o: i32, s: i32| o + (v - o).div_euclid(s) * s;
+        POINT { x: down(p.x, self.origin.x, self.spacing.x), y: down(p.y, self.origin.y, self.spacing.y) }
+    }
+
     pub fn content_origin(&self, group: &Group) -> POINT {
         self.snap_up(POINT { x: group.x + PADDING, y: group.y + HEADER_HEIGHT + PADDING })
     }
@@ -56,6 +61,19 @@ pub fn plan(icons: &[Icon], groups: &[Group], grid: Grid, work_area: impl Fn(POI
     let mut member_moves = Vec::new();
     for ((group, mut list), bounds) in groups.iter().zip(members).zip(group_rects.iter_mut()) {
         list.sort_by_key(|&i| icons[i].name.to_lowercase());
+        if group.collapsed {
+            let stack = grid.snap_down(POINT { x: group.x + PADDING, y: group.y });
+            if !list.is_empty() {
+                let stack_cell = cell(stack, spacing);
+                bounds.left = bounds.left.min(stack_cell.left);
+                bounds.bottom = bounds.bottom.max(stack_cell.bottom);
+            }
+            for i in list {
+                targets[i] = Some(stack);
+                member_moves.push(i);
+            }
+            continue;
+        }
         let start = grid.content_origin(group);
         let cols = ((group.x + group.width - PADDING - start.x) / spacing.x).max(1);
         for (n, i) in list.into_iter().enumerate() {
@@ -91,7 +109,8 @@ pub fn plan(icons: &[Icon], groups: &[Group], grid: Grid, work_area: impl Fn(POI
 }
 
 fn group_rect(group: &Group) -> RECT {
-    RECT { left: group.x, top: group.y, right: group.x + group.width, bottom: group.y + group.height }
+    let height = if group.collapsed { HEADER_HEIGHT } else { group.height };
+    RECT { left: group.x, top: group.y, right: group.x + group.width, bottom: group.y + height }
 }
 
 fn cell(position: POINT, spacing: POINT) -> RECT {
@@ -214,6 +233,18 @@ mod tests {
         assert_eq!(moves.len(), 1);
         assert_eq!(moves[0].0, 0);
         assert!(moves[0].1.x >= 1000);
+    }
+
+    #[test]
+    fn collapsed_group_reserves_only_its_header() {
+        let mut g = group(&["*.txt"]);
+        g.collapsed = true;
+        let icons = vec![icon("a.txt", 14, 2), icon("b.txt", 14, 102), icon("app.exe", 622, 502)];
+        let moves = run(icons, std::slice::from_ref(&g));
+        assert_eq!(moves.len(), 2);
+        assert!(moves.iter().all(|(i, _)| *i < 2));
+        assert_eq!(moves[0].1, moves[1].1);
+        assert!(moves[0].1.y <= 300 && moves[0].1.y + SPACING.y > 300);
     }
 
     #[test]
