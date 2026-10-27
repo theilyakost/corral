@@ -8,19 +8,22 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
-    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory,
-    ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory,
+    ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_EMERGENCY_BREAK, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_WORD_WRAPPING_EMERGENCY_BREAK, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory,
+    IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, ClientToScreen, CreateCompatibleDC, CreateDIBSection,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, HBITMAP, HDC, HGDIOBJ, InvalidateRect, PAINTSTRUCT, SRCCOPY,
-    SelectObject,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, ClientToScreen, CreateCompatibleDC, CreateDIBSection,
+    CreateSolidBrush, DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, FillRect, HBITMAP, HDC, HGDIOBJ,
+    InvalidateRect, PAINTSTRUCT, SelectObject,
 };
 use windows::Win32::Graphics::Imaging::IWICBitmap;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -34,10 +37,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{Result, w};
 
+use crate::composition::Panel;
+use crate::group::HEADER_HEIGHT;
 use crate::shell::{self, MenuChoice};
 
 pub const GLASS_KEY: COLORREF = COLORREF(0x0002_0103);
-const KEY_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 3.0 / 255.0, g: 1.0 / 255.0, b: 2.0 / 255.0, a: 1.0 };
+const TITLE_SIZE: f32 = 13.0;
 const SHADOW_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.75 };
 
 #[derive(Clone, Copy)]
@@ -61,17 +66,12 @@ fn palette() -> Palette {
     let (r, g, b) = rgb(crate::group::label_color());
     let body = rgb(crate::group::body_color());
     let toward = if luminance(body) > 0.5 { 0.0 } else { 1.0 };
-    let mix = |amount: f32| D2D1_COLOR_F {
-        r: body.0 + (toward - body.0) * amount,
-        g: body.1 + (toward - body.1) * amount,
-        b: body.2 + (toward - body.2) * amount,
-        a: 1.0,
-    };
+    let mix = |amount: f32| D2D1_COLOR_F { r: toward, g: toward, b: toward, a: amount };
     Palette {
         text: D2D1_COLOR_F { r, g, b, a: 1.0 },
         shadow: luminance((r, g, b)) > 0.5,
-        hover: mix(0.14),
-        selected: mix(0.26),
+        hover: mix(0.10),
+        selected: mix(0.20),
     }
 }
 
@@ -92,12 +92,12 @@ pub struct Entry {
     bitmap: Option<(u64, ID2D1Bitmap)>,
 }
 
-struct Frame {
-    dc: HDC,
+pub struct Frame {
+    pub dc: HDC,
     bitmap: HBITMAP,
     old: HGDIOBJ,
-    width: i32,
-    height: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 impl Frame {
@@ -146,7 +146,9 @@ struct Shelf {
     scroll: f32,
     tracking: bool,
     extent: (i32, i32),
-    frame: Option<Frame>,
+    title: Vec<u16>,
+    reveal: i32,
+    panel: Option<Panel>,
     dirty: bool,
 }
 
@@ -154,7 +156,7 @@ struct Graphics {
     target: ID2D1DCRenderTarget,
     write: IDWriteFactory,
     formats: Vec<(u32, IDWriteTextFormat)>,
-    generation: u64,
+    titles: Vec<(u32, IDWriteTextFormat)>,
 }
 
 struct Metrics {
@@ -168,7 +170,6 @@ thread_local! {
     static SHELVES: RefCell<HashMap<isize, Shelf>> = RefCell::new(HashMap::new());
     static GRAPHICS: RefCell<Option<Graphics>> = const { RefCell::new(None) };
     static SPACING: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
-    static GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
 fn with_shelf<R>(hwnd: HWND, f: impl FnOnce(&mut Shelf) -> R) -> Option<R> {
@@ -194,6 +195,28 @@ pub fn set_extent(body: HWND, width: i32, height: i32) {
     });
     if changed == Some(true) {
         render(body);
+    }
+}
+
+pub fn set_title(body: HWND, title: &str) {
+    let title: Vec<u16> = title.encode_utf16().collect();
+    let changed = with_shelf(body, |shelf| std::mem::replace(&mut shelf.title, title.clone()) != title);
+    if changed == Some(true) {
+        render(body);
+    }
+}
+
+pub fn set_reveal(body: HWND, height: i32) {
+    with_shelf(body, |shelf| {
+        shelf.reveal = height;
+        apply_clip(shelf);
+    });
+}
+
+fn apply_clip(shelf: &Shelf) {
+    if let Some(panel) = &shelf.panel {
+        let radius = if crate::group::visual_style().rounded { crate::group::RADIUS as f32 } else { 0.0 };
+        _ = panel.clip(shelf.extent.0, shelf.reveal.min(shelf.extent.1), radius);
     }
 }
 
@@ -306,11 +329,7 @@ fn graphics() -> Result<()> {
             let target = factory.CreateDCRenderTarget(&properties)?;
             target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let write: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let generation = GENERATION.with(|g| {
-                g.set(g.get() + 1);
-                g.get()
-            });
-            *cell.borrow_mut() = Some(Graphics { target, write, formats: Vec::new(), generation });
+            *cell.borrow_mut() = Some(Graphics { target, write, formats: Vec::new(), titles: Vec::new() });
             Ok(())
         }
     })
@@ -336,6 +355,27 @@ impl Graphics {
             Ok(format)
         }
     }
+
+    fn title_format(&mut self, scale: f32) -> Result<IDWriteTextFormat> {
+        let key = (scale * 96.0).round() as u32;
+        if let Some((_, format)) = self.titles.iter().find(|(k, _)| *k == key) {
+            return Ok(format.clone());
+        }
+        unsafe {
+            let format = self.write.CreateTextFormat(
+                w!("Segoe UI"), None, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL, TITLE_SIZE * scale, w!(""),
+            )?;
+            format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let trimming = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, ..Default::default() };
+            let sign = self.write.CreateEllipsisTrimmingSign(&format)?;
+            format.SetTrimming(&trimming, &sign)?;
+            self.titles.push((key, format.clone()));
+            Ok(format)
+        }
+    }
 }
 
 pub fn render(body: HWND) {
@@ -347,93 +387,164 @@ pub fn render(body: HWND) {
     }
 }
 
-fn paint_glass(glass: HWND, hdc: HDC) {
+fn paint_glass(glass: HWND) {
     let body = HWND(unsafe { GetWindowLongPtrW(glass, GWLP_USERDATA) } as _);
-    let ready = match graphics().and_then(|_| prepare(body, glass)) {
-        Ok(ready) => ready,
+    match graphics().and_then(|_| draw_panel(body, glass)) {
+        Ok(true) => {}
+        Ok(false) => unsafe { _ = InvalidateRect(Some(glass), None, false) },
         Err(_) => {
-            GRAPHICS.with(|cell| *cell.borrow_mut() = None);
-            false
+            with_shelf(body, |shelf| shelf.panel = None);
+            unsafe { _ = InvalidateRect(Some(glass), None, false) };
         }
-    };
-    let (width, height) = client_size(glass);
-    let blitted = with_shelf(body, |shelf| match &shelf.frame {
-        Some(frame) if ready => unsafe {
-            _ = BitBlt(hdc, 0, 0, width.min(frame.width), height.min(frame.height), Some(frame.dc), 0, 0, SRCCOPY);
-            true
-        },
-        _ => false,
-    });
-    if !ready || blitted.is_none() {
-        unsafe { _ = InvalidateRect(Some(glass), None, false) };
     }
 }
 
-fn prepare(body: HWND, glass: HWND) -> Result<bool> {
-    let Some((dirty, extent)) = with_shelf(body, |shelf| {
-        let fits = shelf.frame.as_ref().is_some_and(|f| (f.width, f.height) == shelf.extent);
-        (shelf.dirty || !fits, shelf.extent)
-    }) else {
+fn rect(x: f32, y: f32, left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
+    D2D_RECT_F { left: x + left, top: y + top, right: x + right, bottom: y + bottom }
+}
+
+fn color(value: u32, alpha: u8) -> D2D1_COLOR_F {
+    let (r, g, b) = rgb(value);
+    D2D1_COLOR_F { r, g, b, a: alpha as f32 / 255.0 }
+}
+
+fn draw_panel(body: HWND, glass: HWND) -> Result<bool> {
+    let Some((dirty, (width, height))) = with_shelf(body, |shelf| (shelf.dirty, shelf.extent)) else {
         return Ok(false);
     };
-    if !dirty {
+    let current = with_shelf(body, |shelf| shelf.panel.as_ref().is_some_and(Panel::is_current)).unwrap_or(false);
+    if !dirty && current {
         return Ok(true);
     }
-    let (width, height) = if extent.0 > 0 && extent.1 > 0 { extent } else { client_size(glass) };
     if width <= 0 || height <= 0 {
         return Ok(true);
     }
+    if !current {
+        let panel = Panel::new(glass)?;
+        with_shelf(body, |shelf| {
+            shelf.panel = Some(panel);
+            for entry in &mut shelf.entries {
+                entry.bitmap = None;
+            }
+            apply_clip(shelf);
+        });
+    }
     let metrics = metrics(body, width as f32);
     load_icons(body, metrics.icon_pixels());
-    GRAPHICS.with(|cell| {
+    let (format, title_format) = GRAPHICS.with(|cell| -> Result<_> {
+        let mut graphics = cell.borrow_mut();
+        let graphics = graphics.as_mut().ok_or_else(windows::core::Error::empty)?;
+        Ok((graphics.format(metrics.scale)?, graphics.title_format(metrics.scale)?))
+    })?;
+    let style = crate::group::visual_style();
+    let drawn = with_shelf(body, |shelf| -> Result<()> {
+        let Some(mut panel) = shelf.panel.take() else { return Ok(()) };
+        let result = panel.draw(width, height, |device, x, y| unsafe {
+            let target: &ID2D1RenderTarget = &device.context;
+            let (w, h, hh) = (width as f32, height as f32, HEADER_HEIGHT as f32);
+            let r = if style.rounded { crate::group::RADIUS as f32 } else { 0.0 };
+            let shape = |inset: f32| D2D1_ROUNDED_RECT {
+                rect: rect(x, y, inset, inset, w - inset, h - inset),
+                radiusX: r,
+                radiusY: r,
+            };
+            let brush = target.CreateSolidColorBrush(&color(style.body, style.body_alpha), None)?;
+
+            target.PushAxisAlignedClip(&rect(x, y, 0.0, hh, w, h), D2D1_ANTIALIAS_MODE_ALIASED);
+            target.FillRoundedRectangle(&shape(0.0), &brush);
+            target.PopAxisAlignedClip();
+
+            target.PushAxisAlignedClip(&rect(x, y, 0.0, 0.0, w, hh), D2D1_ANTIALIAS_MODE_ALIASED);
+            brush.SetColor(&color(style.header, style.header_alpha));
+            let header = D2D1_ROUNDED_RECT { rect: rect(x, y, 0.0, 0.0, w, hh + r + 1.0), radiusX: r, radiusY: r };
+            target.FillRoundedRectangle(&header, &brush);
+            target.PopAxisAlignedClip();
+
+            brush.SetColor(&color(style.border, 255));
+            target.FillRectangle(&rect(x, y, 1.0, hh - 1.0, w - 1.0, hh), &brush);
+
+            brush.SetColor(&color(style.title, 255));
+            let s = metrics.scale;
+            target.DrawText(
+                &shelf.title, &title_format, &rect(x, y, 10.0 * s, 0.0, w - 10.0 * s, hh), &brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            let visible = h - hh;
+            let max_scroll = (metrics.content_height(shelf.entries.len()) - visible).max(0.0);
+            shelf.scroll = shelf.scroll.clamp(0.0, max_scroll);
+            let palette = palette();
+            target.PushAxisAlignedClip(&rect(x, y, 0.0, hh, w, h), D2D1_ANTIALIAS_MODE_ALIASED);
+            for index in 0..shelf.entries.len() {
+                let cell = metrics.cell(index, shelf.scroll);
+                if cell.bottom < 0.0 || cell.top > visible {
+                    continue;
+                }
+                let highlight = if shelf.selected == Some(index) {
+                    Some(palette.selected)
+                } else if shelf.hover == Some(index) {
+                    Some(palette.hover)
+                } else {
+                    None
+                };
+                let entry = &mut shelf.entries[index];
+                let bitmap = entry_bitmap(target, entry, device.generation);
+                let cell = rect(x, y + hh, cell.left, cell.top, cell.right, cell.bottom);
+                draw_entry(target, &brush, &format, &metrics, &palette, entry, bitmap.as_ref(), cell, highlight);
+            }
+            target.PopAxisAlignedClip();
+
+            brush.SetColor(&color(style.border, 255));
+            target.DrawRoundedRectangle(&shape(0.5), &brush, 1.0, None);
+            Ok(())
+        });
+        shelf.panel = Some(panel);
+        if result.is_ok() {
+            shelf.dirty = false;
+        }
+        result
+    });
+    match drawn {
+        Some(result) => result.map(|_| true),
+        None => Ok(false),
+    }
+}
+
+pub fn drag_image(body: HWND, index: usize) -> Option<Frame> {
+    graphics().ok()?;
+    let metrics = metrics(body, client_size(body).0 as f32);
+    load_icons(body, metrics.icon_pixels());
+    let (width, height) = (metrics.cell_width.round() as i32, metrics.cell_height.round() as i32);
+    let frame = Frame::new(width, height)?;
+    let drawn = GRAPHICS.with(|cell| -> Result<()> {
         let mut graphics = cell.borrow_mut();
         let graphics = graphics.as_mut().ok_or_else(windows::core::Error::empty)?;
         let format = graphics.format(metrics.scale)?;
-        let generation = graphics.generation;
         let target = &graphics.target;
-        let drawn = with_shelf(body, |shelf| -> Result<()> {
-            if shelf.frame.as_ref().is_none_or(|f| (f.width, f.height) != (width, height)) {
-                shelf.frame = Frame::new(width, height);
-            }
-            let Some(frame) = &shelf.frame else { return Err(windows::core::Error::empty()) };
-            unsafe {
-                target.BindDC(frame.dc, &RECT { left: 0, top: 0, right: width, bottom: height })?;
-                target.BeginDraw();
-                target.Clear(Some(&KEY_COLOR));
-                let palette = palette();
-                let brush = target.CreateSolidColorBrush(&palette.text, None)?;
-                let max_scroll = (metrics.content_height(shelf.entries.len()) - height as f32).max(0.0);
-                shelf.scroll = shelf.scroll.clamp(0.0, max_scroll);
-                for index in 0..shelf.entries.len() {
-                    let cell = metrics.cell(index, shelf.scroll);
-                    if cell.bottom < 0.0 || cell.top > height as f32 {
-                        continue;
-                    }
-                    let highlight = if shelf.selected == Some(index) {
-                        Some(palette.selected)
-                    } else if shelf.hover == Some(index) {
-                        Some(palette.hover)
-                    } else {
-                        None
+        unsafe {
+            target.BindDC(frame.dc, &RECT { left: 0, top: 0, right: width, bottom: height })?;
+            target.BeginDraw();
+            target.Clear(Some(&D2D1_COLOR_F::default()));
+            let palette = palette();
+            let brush = target.CreateSolidColorBrush(&palette.text, None)?;
+            with_shelf(body, |shelf| {
+                if let Some(entry) = shelf.entries.get_mut(index) {
+                    let bitmap = match &entry.icon {
+                        Some((_, Some(icon))) => target.CreateBitmapFromWicBitmap(icon, None).ok(),
+                        _ => None,
                     };
-                    let entry = &mut shelf.entries[index];
-                    let bitmap = entry_bitmap(target, entry, generation);
+                    let cell = D2D_RECT_F { left: 0.0, top: 0.0, right: width as f32, bottom: height as f32 };
+                    let highlight = Some(D2D1_COLOR_F { a: 0.55, ..palette.selected });
                     draw_entry(target, &brush, &format, &metrics, &palette, entry, bitmap.as_ref(), cell, highlight);
                 }
-                target.EndDraw(None, None)?;
-                crate::group::frame_body(frame.dc, width, height, GLASS_KEY.0);
-            }
-            shelf.dirty = false;
-            Ok(())
-        });
-        match drawn {
-            Some(result) => result.map(|_| true),
-            None => Ok(false),
+            });
+            target.EndDraw(None, None)
         }
-    })
+    });
+    drawn.ok().map(|_| frame)
 }
 
-fn entry_bitmap(target: &ID2D1DCRenderTarget, entry: &mut Entry, generation: u64) -> Option<ID2D1Bitmap> {
+fn entry_bitmap(target: &ID2D1RenderTarget, entry: &mut Entry, generation: u64) -> Option<ID2D1Bitmap> {
     if let Some((built, bitmap)) = &entry.bitmap {
         if *built == generation {
             return Some(bitmap.clone());
@@ -446,7 +557,7 @@ fn entry_bitmap(target: &ID2D1DCRenderTarget, entry: &mut Entry, generation: u64
 }
 
 fn draw_entry(
-    target: &ID2D1DCRenderTarget,
+    target: &ID2D1RenderTarget,
     brush: &ID2D1SolidColorBrush,
     format: &IDWriteTextFormat,
     metrics: &Metrics,
@@ -543,9 +654,9 @@ pub unsafe extern "system" fn shelf_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 set_state(hwnd, |shelf| std::mem::replace(&mut shelf.selected, index) != index);
                 let mut at = POINT { x: (lparam.0 & 0xFFFF) as i16 as i32, y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 };
                 _ = ClientToScreen(hwnd, &mut at);
-                if let Some((name, item)) = index.and_then(|i| entry(hwnd, i)) {
+                if let Some((i, (name, item))) = index.and_then(|i| entry(hwnd, i).map(|e| (i, e))) {
                     if DragDetect(hwnd, at).as_bool() {
-                        crate::drag_member(hwnd, GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize, &name, &item);
+                        crate::drag_member(hwnd, GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize, i, &name, &item);
                     }
                 }
                 LRESULT(0)
@@ -592,8 +703,11 @@ pub unsafe extern "system" fn glass_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                paint_glass(hwnd, hdc);
+                let brush = CreateSolidBrush(GLASS_KEY);
+                FillRect(hdc, &ps.rcPaint, brush);
+                _ = DeleteObject(brush.into());
                 _ = EndPaint(hwnd, &ps);
+                paint_glass(hwnd);
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),

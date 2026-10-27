@@ -2,7 +2,7 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POI
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
     DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint,
-    CreateRectRgn, CreateRoundRectRgn, FW_SEMIBOLD, FillRect, FrameRgn, GetWindowRgn, HDC, HRGN, InvalidateRect,
+    CreateRectRgn, CreateRoundRectRgn, FW_SEMIBOLD, FillRect, FrameRgn, GetWindowRgn, HRGN, InvalidateRect,
     OUT_DEFAULT_PRECIS, SetWindowRgn, PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode,
     SetTextColor, TRANSPARENT,
 };
@@ -25,16 +25,18 @@ use std::cell::Cell;
 use crate::config::{Appearance, Group, parse_color};
 
 pub const HEADER_HEIGHT: i32 = 28;
+const INPUT_ALPHA: u8 = 1;
+
 #[derive(Clone, Copy)]
-struct Style {
-    header: u32,
-    body: u32,
-    title: u32,
-    border: u32,
+pub struct Style {
+    pub header: u32,
+    pub body: u32,
+    pub title: u32,
+    pub border: u32,
     label: u32,
-    header_alpha: u8,
-    body_alpha: u8,
-    rounded: bool,
+    pub header_alpha: u8,
+    pub body_alpha: u8,
+    pub rounded: bool,
 }
 
 thread_local! {
@@ -73,6 +75,10 @@ fn current_style() -> Style {
     STYLE.with(Cell::get)
 }
 
+pub fn visual_style() -> Style {
+    current_style()
+}
+
 pub fn label_color() -> u32 {
     current_style().label
 }
@@ -86,20 +92,6 @@ pub fn body_region(width: i32, height: i32) -> HRGN {
         } else {
             CreateRectRgn(0, -1, width, height)
         }
-    }
-}
-
-pub fn frame_body(hdc: HDC, width: i32, height: i32, key: u32) {
-    let mut color = current_style().border;
-    if color == key {
-        color ^= 0x0001_0000;
-    }
-    unsafe {
-        let region = body_region(width, height);
-        let brush = CreateSolidBrush(COLORREF(color));
-        _ = FrameRgn(hdc, region, brush, 1, 1);
-        _ = DeleteObject(brush.into());
-        _ = DeleteObject(region.into());
     }
 }
 
@@ -188,8 +180,13 @@ impl GroupWindows {
             SetWindowLongPtrW(body, GWLP_USERDATA, index as isize);
             crate::drop::register(header, index, true);
             crate::drop::register(body, index, false);
-            _ = SetLayeredWindowAttributes(header, COLORREF(0), current_style().header_alpha, LWA_ALPHA);
-            _ = SetLayeredWindowAttributes(body, COLORREF(0), current_style().body_alpha, LWA_ALPHA);
+            let (header_alpha, body_alpha) = if owned {
+                (INPUT_ALPHA, INPUT_ALPHA)
+            } else {
+                (current_style().header_alpha, current_style().body_alpha)
+            };
+            _ = SetLayeredWindowAttributes(header, COLORREF(0), header_alpha, LWA_ALPHA);
+            _ = SetLayeredWindowAttributes(body, COLORREF(0), body_alpha, LWA_ALPHA);
             let glass = if owned {
                 let ex_style = ex_style | WS_EX_TRANSPARENT;
                 let glass = CreateWindowExW(ex_style, w!("CorralGlass"), &title, style, 0, 0, 0, 0, Some(host), None, Some(instance), None);
@@ -223,13 +220,7 @@ impl GroupWindows {
             _ = ScreenToClient(self.host, &mut origin);
             _ = SetWindowPos(self.header, Some(HWND_TOP), origin.x, origin.y, group.width, HEADER_HEIGHT, SWP_NOACTIVATE);
             let (width, height) = (group.width, (group.height - HEADER_HEIGHT).max(0));
-            if self.glass.is_some() {
-                crate::shelf::set_extent(self.body, width, height);
-            }
-            if let Some(glass) = self.glass {
-                _ = SetWindowPos(glass, Some(self.header), origin.x, origin.y + HEADER_HEIGHT, width, height, SWP_NOACTIVATE);
-            }
-            let below = self.glass.unwrap_or(self.def_view);
+            let below = if self.glass.is_some() { self.header } else { self.def_view };
             _ = SetWindowPos(
                 self.body,
                 Some(below),
@@ -239,23 +230,32 @@ impl GroupWindows {
                 height,
                 SWP_NOACTIVATE,
             );
-        }
-        self.reshape();
-    }
-
-    pub fn set_open(&self, open: bool) {
-        let command = if open { SW_SHOWNA } else { SW_HIDE };
-        unsafe {
-            _ = ShowWindow(self.body, command);
             if let Some(glass) = self.glass {
-                _ = ShowWindow(glass, command);
+                crate::shelf::set_extent(self.body, width, group.height);
+                _ = SetWindowPos(glass, Some(self.body), origin.x, origin.y, width, group.height, SWP_NOACTIVATE);
+                let visible = if self.is_open() { group.height } else { HEADER_HEIGHT };
+                crate::shelf::set_reveal(self.body, visible);
             }
         }
         self.reshape();
     }
 
+    pub fn owns(&self, hwnd: HWND) -> bool {
+        hwnd == self.header || hwnd == self.body || self.glass == Some(hwnd)
+    }
+
+    pub fn set_open(&self, open: bool) {
+        let command = if open { SW_SHOWNA } else { SW_HIDE };
+        unsafe { _ = ShowWindow(self.body, command) };
+        if self.glass.is_some() {
+            let visible = if open { HEADER_HEIGHT + client(self.body).bottom } else { HEADER_HEIGHT };
+            crate::shelf::set_reveal(self.body, visible);
+        }
+        self.reshape();
+    }
+
     fn reshape(&self) {
-        let rounded = current_style().rounded;
+        let rounded = current_style().rounded && self.glass.is_none();
         let width = client(self.header).right;
         let body = client(self.body).bottom;
         let open = self.is_open();
@@ -279,6 +279,12 @@ impl GroupWindows {
     }
 
     pub fn restyle(&self) {
+        if self.glass.is_some() {
+            let visible = if self.is_open() { HEADER_HEIGHT + client(self.body).bottom } else { HEADER_HEIGHT };
+            crate::shelf::set_reveal(self.body, visible);
+            crate::shelf::render(self.body);
+            return;
+        }
         let style = current_style();
         unsafe {
             _ = SetLayeredWindowAttributes(self.header, COLORREF(0), style.header_alpha, LWA_ALPHA);
@@ -294,6 +300,9 @@ impl GroupWindows {
             _ = SetWindowTextW(self.header, &HSTRING::from(text));
             _ = InvalidateRect(Some(self.header), None, false);
         }
+        if self.glass.is_some() {
+            crate::shelf::set_title(self.body, text);
+        }
     }
 
     pub fn is_open(&self) -> bool {
@@ -308,20 +317,17 @@ impl GroupWindows {
             _ = ScreenToClient(self.host, &mut origin);
             let flags = SWP_NOACTIVATE | SWP_NOZORDER;
             let (x, y) = (origin.x, origin.y + HEADER_HEIGHT);
-            if let Some(glass) = self.glass {
-                _ = SetWindowPos(glass, None, x, y, group.width, height, flags);
-            }
             _ = SetWindowPos(self.body, None, x, y, group.width, height, flags);
+        }
+        if self.glass.is_some() {
+            crate::shelf::set_reveal(self.body, HEADER_HEIGHT + height);
         }
         self.reshape();
     }
 
     pub fn set_marker(&self, group: &Group, collapsed: bool) {
         let marker = if collapsed { "▸" } else { "▾" };
-        unsafe {
-            _ = SetWindowTextW(self.header, &HSTRING::from(format!("{marker}  {}", group.name)));
-            _ = InvalidateRect(Some(self.header), None, false);
-        }
+        self.set_title(&format!("{marker}  {}", group.name));
     }
 
     pub fn set_collapsed(&self, group: &Group, collapsed: bool) {

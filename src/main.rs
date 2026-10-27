@@ -2,8 +2,10 @@
 
 mod agent;
 mod autostart;
+mod composition;
 mod config;
 mod desktop;
+mod dragging;
 mod drop;
 mod group;
 mod icon;
@@ -312,13 +314,49 @@ pub fn set_rules(index: usize, rules: Vec<String>) {
     }
 }
 
-pub fn drag_member(shelf: HWND, index: usize, name: &str, item: &IShellItem) {
-    with_app(|app| app.agent.as_ref().map(|a| a.set_dragging(true)));
-    let dropped = drop::drag_item(shelf, item);
-    with_app(|app| app.agent.as_ref().map(|a| a.set_dragging(false)));
-    if dropped {
-        dragged_out(index, name);
+pub fn drag_member(shelf: HWND, index: usize, entry: usize, name: &str, item: &IShellItem) {
+    let icons = visible_icon_cells();
+    let views = handles().map(|(_, def_view, list_view)| (def_view, list_view));
+    let classify = |cursor: POINT, under: HWND| {
+        if let Some(Some(group)) = with_app(|app| app.windows.iter().find(|w| w.owns(under)).map(|w| w.index)) {
+            return dragging::Target::Group(group);
+        }
+        let on_desktop = views.is_some_and(|(def_view, list_view)| under == def_view || under == list_view);
+        let on_icon = icons.iter().any(|r| cursor.x >= r.left && cursor.x < r.right && cursor.y >= r.top && cursor.y < r.bottom);
+        if on_desktop && !on_icon { dragging::Target::Desktop } else { dragging::Target::Elsewhere }
+    };
+    match dragging::run(shelf, entry, classify) {
+        dragging::Outcome::Group(target) if target != index => put_into_group(target, vec![name.to_string()]),
+        dragging::Outcome::Desktop => dragged_out(index, name),
+        dragging::Outcome::Handoff => {
+            with_app(|app| app.agent.as_ref().map(|a| a.set_dragging(true)));
+            let dropped = drop::drag_item(shelf, item);
+            with_app(|app| app.agent.as_ref().map(|a| a.set_dragging(false)));
+            if dropped {
+                dragged_out(index, name);
+            }
+        }
+        _ => {}
     }
+}
+
+fn visible_icon_cells() -> Vec<windows::Win32::Foundation::RECT> {
+    let Some(groups) = with_app(|app| app.layout_groups()) else { return Vec::new() };
+    DESKTOP.with(|cell| {
+        let Ok(desktop) = cell.try_borrow() else { return Vec::new() };
+        let Some(desktop) = desktop.as_ref() else { return Vec::new() };
+        let (Ok(items), Ok(spacing)) = (desktop.items(), desktop.spacing()) else { return Vec::new() };
+        items
+            .iter()
+            .filter(|i| config::group_of(&groups, &i.name).is_none())
+            .map(|i| windows::Win32::Foundation::RECT {
+                left: i.position.x,
+                top: i.position.y,
+                right: i.position.x + spacing.x,
+                bottom: i.position.y + spacing.y,
+            })
+            .collect()
+    })
 }
 
 fn dragged_out(index: usize, name: &str) {
