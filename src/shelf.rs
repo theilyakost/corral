@@ -262,12 +262,28 @@ fn load_icons(body: HWND, pixels: i32) {
 fn metrics(hwnd: HWND, width: f32) -> Metrics {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
-    let (step_x, cell_height) = SPACING
+    let (step_x, step_y) = SPACING
         .with(|cell| cell.get())
         .map_or((CELL_WIDTH * scale, CELL_HEIGHT * scale), |(x, y)| (x as f32, y as f32));
     let columns = ((width / step_x).round() as usize).max(1);
     let cell_width = width.max(step_x) / columns as f32;
+    let visible = body_height(hwnd) - 2.0 * PADDING * scale;
+    let cell_height = fitted_rows(visible, step_y, CELL_HEIGHT * scale * 0.8);
     Metrics { scale, columns, cell_width, cell_height }
+}
+
+fn body_height(hwnd: HWND) -> f32 {
+    with_shelf(hwnd, |shelf| shelf.extent.1 - HEADER_HEIGHT)
+        .filter(|h| *h > 0)
+        .unwrap_or_else(|| client_size(hwnd).1) as f32
+}
+
+fn fitted_rows(visible: f32, step: f32, minimum: f32) -> f32 {
+    if visible <= 0.0 {
+        return step;
+    }
+    let rows = (visible / step).round().max(1.0);
+    (visible / rows).max(minimum)
 }
 
 impl Metrics {
@@ -714,5 +730,20 @@ pub unsafe extern "system" fn glass_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_stretch_to_fill_the_body() {
+        let rows = |visible: f32| visible / fitted_rows(visible, 100.0, 77.0);
+        assert_eq!(rows(300.0), 3.0);
+        assert_eq!(rows(272.0), 3.0);
+        assert_eq!(rows(330.0), 3.0);
+        assert_eq!(rows(1000.0), 10.0);
+        assert!(fitted_rows(72.0, 100.0, 77.0) >= 77.0);
     }
 }

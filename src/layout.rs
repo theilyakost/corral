@@ -75,10 +75,15 @@ struct Cells {
 
 impl Cells {
     fn of(grid: Grid, area: RECT) -> Cells {
-        let first = grid.snap_up(POINT { x: area.left, y: area.top });
         let spacing = grid.spacing;
-        let columns = ((area.right - first.x) / spacing.x).max(1);
-        let rows = ((area.bottom - first.y) / spacing.y).max(1);
+        let nearest = |edge: i32, origin: i32, step: i32| origin + (edge - origin + step / 2).div_euclid(step) * step;
+        let first = POINT {
+            x: nearest(area.left, grid.origin.x, spacing.x),
+            y: nearest(area.top, grid.origin.y, spacing.y),
+        };
+        let count = |from: i32, to: i32, step: i32| ((to - from + step / 2).div_euclid(step)).max(1);
+        let columns = count(first.x, area.right, spacing.x);
+        let rows = count(first.y, area.bottom, spacing.y);
         Cells { first, columns, rows, spacing, area }
     }
 
@@ -421,6 +426,24 @@ mod tests {
         assert!(on_cells(moved));
         assert_eq!((moved.width, moved.height), (4 * SPACING.x, 3 * SPACING.y));
         assert_eq!(fit_group(edge, Some(GRID), SCREEN), edge);
+    }
+
+    #[test]
+    fn edge_cells_never_add_or_lose_a_column() {
+        let shifted = Grid { origin: POINT { x: 70, y: 4 }, spacing: SPACING };
+        for (x, y) in [(0, 0), (300, 300), (5000, 5000), (-50, 900)] {
+            let f = fit_group(frame(x, y, 3 * SPACING.x, 3 * SPACING.y), Some(shifted), SCREEN);
+            assert!((f.width - 3 * SPACING.x).abs() < SPACING.x / 2, "{x},{y} -> {f:?}");
+            assert!((f.height - 3 * SPACING.y).abs() < SPACING.y / 2, "{x},{y} -> {f:?}");
+            assert!(f.x >= SCREEN.left && f.x + f.width <= SCREEN.right);
+            assert!(f.y >= SCREEN.top && f.y + f.height <= SCREEN.bottom);
+        }
+        let edge = fit_group(frame(0, 0, 3 * SPACING.x, 3 * SPACING.y), Some(shifted), SCREEN);
+        assert_eq!((edge.x, edge.y), (0, 0));
+        let start = trim_group(edge, Some(shifted), SCREEN);
+        let moved = fit_group(Frame { x: start.x + 400, y: start.y + 400, ..start }, Some(shifted), SCREEN);
+        assert_eq!((moved.width, moved.height), (3 * SPACING.x, 3 * SPACING.y));
+        assert_eq!((moved.x - shifted.origin.x).rem_euclid(SPACING.x), 0);
     }
 
     #[test]
