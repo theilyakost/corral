@@ -44,12 +44,25 @@ const ID_ANIMATE: i32 = 118;
 const ID_HOVER: i32 = 119;
 const ID_AGENT: i32 = 120;
 const ID_AUTOSTART: i32 = 121;
+const ID_BORDER_COLOR: i32 = 122;
+const ID_BORDER_SWATCH: i32 = 123;
+const ID_ROUNDED: i32 = 124;
+const ID_LABEL_COLOR: i32 = 125;
+const ID_LABEL_SWATCH: i32 = 126;
+const ID_THEME: i32 = 127;
+
+const CBS_DROPDOWNLIST: u32 = 0x0003;
+const CB_ADDSTRING: u32 = 0x0143;
+const CB_GETCURSEL: u32 = 0x0147;
+const CB_SETCURSEL: u32 = 0x014E;
+const CBN_SELCHANGE: u32 = 1;
+const CUSTOM_THEME: &str = "Своя тема";
 
 const TBM_GETPOS: u32 = 0x0400;
 const TIMER_RULES: usize = 1;
 const RULES_DELAY_MS: u32 = 600;
 const WIDTH: i32 = 680;
-const HEIGHT: i32 = 490;
+const HEIGHT: i32 = 616;
 const GROUP_FIELDS: [i32; 4] = [ID_REMOVE, ID_NAME, ID_RULES, ID_COLLAPSED];
 
 struct Settings {
@@ -57,7 +70,7 @@ struct Settings {
     selected: Option<usize>,
     loading: bool,
     font: HFONT,
-    swatches: [(i32, HBRUSH); 3],
+    swatches: [(i32, HBRUSH); 5],
     custom: [COLORREF; 16],
 }
 
@@ -151,31 +164,45 @@ pub fn open(instance: HINSTANCE) {
         add(w!("STATIC"), "Правила: маски файлов, по одной на строку (например *.pdf)", plain, none, -1, [236, 68, 428, 18]);
         let multiline = WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) as u32) | WS_VSCROLL | WS_TABSTOP;
         add(w!("EDIT"), "", multiline, WS_EX_CLIENTEDGE, ID_RULES, [236, 88, 428, 90]);
-        add(w!("BUTTON"), "Свёрнута", check, none, ID_COLLAPSED, [236, 186, 200, 22]);
+        add(w!("BUTTON"), "Режим плашки (только заголовок, раскрывается при наведении)", check, none, ID_COLLAPSED, [236, 186, 428, 22]);
 
-        add(w!("BUTTON"), "Оформление", WINDOW_STYLE(BS_GROUPBOX as u32), none, -1, [236, 216, 428, 192]);
+        add(w!("BUTTON"), "Оформление", WINDOW_STYLE(BS_GROUPBOX as u32), none, -1, [236, 216, 428, 320]);
+        add(w!("STATIC"), "Тема", plain, none, -1, [252, 241, 56, 18]);
+        let combo = WINDOW_STYLE(CBS_DROPDOWNLIST) | WS_VSCROLL | WS_TABSTOP;
+        add(w!("COMBOBOX"), "", combo, none, ID_THEME, [310, 236, 340, 320]);
         for (row, (id, swatch, text)) in [
             (ID_HEADER_COLOR, ID_HEADER_SWATCH, "Цвет шапки…"),
             (ID_BODY_COLOR, ID_BODY_SWATCH, "Цвет тела…"),
             (ID_TITLE_COLOR, ID_TITLE_SWATCH, "Цвет заголовка…"),
+            (ID_BORDER_COLOR, ID_BORDER_SWATCH, "Цвет рамки…"),
+            (ID_LABEL_COLOR, ID_LABEL_SWATCH, "Цвет подписей…"),
         ]
         .into_iter()
         .enumerate()
         {
-            let y = 240 + row as i32 * 32;
+            let y = 274 + row as i32 * 32;
             add(w!("BUTTON"), text, button, none, id, [252, y, 130, 26]);
             add(w!("STATIC"), "", WS_BORDER, none, swatch, [390, y + 2, 36, 22]);
         }
         let slider = WS_TABSTOP;
-        add(w!("STATIC"), "Прозрачность шапки", plain, none, -1, [450, 240, 200, 18]);
-        add(TRACKBAR_CLASSW, "", slider, none, ID_HEADER_OPACITY, [444, 258, 212, 28]);
-        add(w!("STATIC"), "Прозрачность тела", plain, none, -1, [450, 292, 200, 18]);
-        add(TRACKBAR_CLASSW, "", slider, none, ID_BODY_OPACITY, [444, 310, 212, 28]);
-        add(w!("BUTTON"), "Анимация раскрытия", check, none, ID_ANIMATE, [252, 344, 300, 22]);
-        add(w!("BUTTON"), "Раскрывать свёрнутые при наведении", check, none, ID_HOVER, [252, 372, 300, 22]);
+        add(w!("STATIC"), "Прозрачность шапки", plain, none, -1, [450, 276, 200, 18]);
+        add(TRACKBAR_CLASSW, "", slider, none, ID_HEADER_OPACITY, [444, 294, 212, 28]);
+        add(w!("STATIC"), "Прозрачность тела", plain, none, -1, [450, 330, 200, 18]);
+        add(TRACKBAR_CLASSW, "", slider, none, ID_BODY_OPACITY, [444, 348, 212, 28]);
+        add(w!("BUTTON"), "Анимация раскрытия", check, none, ID_ANIMATE, [252, 440, 300, 22]);
+        add(w!("BUTTON"), "Раскрывать плашки при наведении", check, none, ID_HOVER, [252, 468, 300, 22]);
+        add(w!("BUTTON"), "Скруглённые углы", check, none, ID_ROUNDED, [252, 496, 300, 22]);
 
-        add(w!("BUTTON"), "Прятать иконки в группах (агент в Проводнике)", check, none, ID_AGENT, [236, 420, 428, 22]);
-        add(w!("BUTTON"), "Запускать при входе в Windows", check, none, ID_AUTOSTART, [236, 446, 428, 22]);
+        add(w!("BUTTON"), "Прятать иконки в группах (агент в Проводнике)", check, none, ID_AGENT, [236, 548, 428, 22]);
+        add(w!("BUTTON"), "Запускать при входе в Windows", check, none, ID_AUTOSTART, [236, 576, 428, 22]);
+
+        if let Ok(themes) = GetDlgItem(Some(hwnd), ID_THEME) {
+            let names = crate::themes::THEMES.iter().map(|t| t.name).chain([CUSTOM_THEME]);
+            for name in names {
+                let wide = HSTRING::from(name);
+                SendMessageW(themes, CB_ADDSTRING, None, Some(LPARAM(wide.as_ptr() as isize)));
+            }
+        }
 
         for id in [ID_HEADER_OPACITY, ID_BODY_OPACITY] {
             if let Ok(slider) = GetDlgItem(Some(hwnd), id) {
@@ -189,7 +216,13 @@ pub fn open(instance: HINSTANCE) {
                 selected: None,
                 loading: false,
                 font,
-                swatches: [(ID_HEADER_SWATCH, HBRUSH::default()), (ID_BODY_SWATCH, HBRUSH::default()), (ID_TITLE_SWATCH, HBRUSH::default())],
+                swatches: [
+                    (ID_HEADER_SWATCH, HBRUSH::default()),
+                    (ID_BODY_SWATCH, HBRUSH::default()),
+                    (ID_TITLE_SWATCH, HBRUSH::default()),
+                    (ID_BORDER_SWATCH, HBRUSH::default()),
+                    (ID_LABEL_SWATCH, HBRUSH::default()),
+                ],
                 custom: [COLORREF(0x00FFFFFF); 16],
             })
         });
@@ -279,14 +312,19 @@ fn load_group(hwnd: HWND, selected: Option<usize>) {
 }
 
 fn load_appearance(hwnd: HWND, appearance: &Appearance) {
+    let theme = crate::themes::current(appearance).unwrap_or(crate::themes::THEMES.len());
+    send(hwnd, ID_THEME, CB_SETCURSEL, theme, 0);
     send(hwnd, ID_HEADER_OPACITY, TBM_SETPOS, 1, appearance.header_opacity as isize);
     send(hwnd, ID_BODY_OPACITY, TBM_SETPOS, 1, appearance.body_opacity as isize);
     set_check(hwnd, ID_ANIMATE, appearance.animate);
     set_check(hwnd, ID_HOVER, appearance.hover_open);
+    set_check(hwnd, ID_ROUNDED, appearance.rounded);
     let colors = [
         (ID_HEADER_SWATCH, &appearance.header_color),
         (ID_BODY_SWATCH, &appearance.body_color),
         (ID_TITLE_SWATCH, &appearance.title_color),
+        (ID_BORDER_SWATCH, &appearance.border_color),
+        (ID_LABEL_SWATCH, &appearance.label_color),
     ];
     with_settings(|s| {
         for (slot, (id, color)) in s.swatches.iter_mut().zip(colors) {
@@ -298,7 +336,7 @@ fn load_appearance(hwnd: HWND, appearance: &Appearance) {
             }
         }
     });
-    for id in [ID_HEADER_SWATCH, ID_BODY_SWATCH, ID_TITLE_SWATCH] {
+    for id in [ID_HEADER_SWATCH, ID_BODY_SWATCH, ID_TITLE_SWATCH, ID_BORDER_SWATCH, ID_LABEL_SWATCH] {
         if let Some(control) = item(hwnd, id) {
             unsafe { _ = InvalidateRect(Some(control), None, true) };
         }
@@ -388,19 +426,29 @@ fn command(hwnd: HWND, id: i32, code: u32) {
                 crate::set_collapsed(index, checked(hwnd, ID_COLLAPSED));
             }
         }
-        (ID_HEADER_COLOR | ID_BODY_COLOR | ID_TITLE_COLOR, BN_CLICKED) => {
+        (ID_HEADER_COLOR | ID_BODY_COLOR | ID_TITLE_COLOR | ID_BORDER_COLOR | ID_LABEL_COLOR, BN_CLICKED) => {
             let Some(appearance) = crate::config().map(|c| c.appearance) else { return };
             let current = match id {
                 ID_HEADER_COLOR => appearance.header_color,
                 ID_BODY_COLOR => appearance.body_color,
+                ID_BORDER_COLOR => appearance.border_color,
+                ID_LABEL_COLOR => appearance.label_color,
                 _ => appearance.title_color,
             };
             if let Some(color) = pick_color(hwnd, &current) {
                 change_appearance(hwnd, |a| match id {
                     ID_HEADER_COLOR => a.header_color = color,
                     ID_BODY_COLOR => a.body_color = color,
+                    ID_BORDER_COLOR => a.border_color = color,
+                    ID_LABEL_COLOR => a.label_color = color,
                     _ => a.title_color = color,
                 });
+            }
+        }
+        (ID_THEME, CBN_SELCHANGE) if !loading() => {
+            let index = send(hwnd, ID_THEME, CB_GETCURSEL, 0, 0);
+            if let Some(theme) = usize::try_from(index).ok().and_then(|i| crate::themes::THEMES.get(i)) {
+                change_appearance(hwnd, |a| *a = theme.apply(a));
             }
         }
         (ID_ANIMATE, BN_CLICKED) => {
@@ -410,6 +458,10 @@ fn command(hwnd: HWND, id: i32, code: u32) {
         (ID_HOVER, BN_CLICKED) => {
             let on = checked(hwnd, ID_HOVER);
             change_appearance(hwnd, |a| a.hover_open = on);
+        }
+        (ID_ROUNDED, BN_CLICKED) => {
+            let on = checked(hwnd, ID_ROUNDED);
+            change_appearance(hwnd, |a| a.rounded = on);
         }
         (ID_AGENT, BN_CLICKED) => {
             crate::set_agent(checked(hwnd, ID_AGENT));

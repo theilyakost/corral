@@ -2,7 +2,8 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POI
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
     DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint,
-    FW_SEMIBOLD, FillRect, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode,
+    CreateRectRgn, CreateRoundRectRgn, FW_SEMIBOLD, FillRect, FrameRgn, GetWindowRgn, HDC, HRGN, InvalidateRect,
+    OUT_DEFAULT_PRECIS, SetWindowRgn, PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode,
     SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::SystemServices::MK_LBUTTON;
@@ -14,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MA_NOACTIVATE, RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, SetLayeredWindowAttributes,
     IsWindowVisible, SetWindowTextW, ShowWindow,
     LWA_COLORKEY, SetWindowLongPtrW, SetWindowPos, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_CHILD,
+    WM_LBUTTONDBLCLK, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_CHILD,
     WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT, WS_VISIBLE,
 };
 use windows::core::{HSTRING, Result, w};
@@ -29,13 +30,25 @@ struct Style {
     header: u32,
     body: u32,
     title: u32,
+    border: u32,
+    label: u32,
     header_alpha: u8,
     body_alpha: u8,
+    rounded: bool,
 }
 
 thread_local! {
     static STYLE: Cell<Style> = const {
-        Cell::new(Style { header: 0x00201C1A, body: 0x00141210, title: 0x00F0F0F0, header_alpha: 215, body_alpha: 110 })
+        Cell::new(Style {
+            header: 0x00201C1A,
+            body: 0x00141210,
+            title: 0x00F0F0F0,
+            border: 0x005E524A,
+            label: 0x00FFFFFF,
+            header_alpha: 215,
+            body_alpha: 110,
+            rounded: true,
+        })
     };
 }
 
@@ -47,14 +60,60 @@ pub fn set_style(appearance: &Appearance) {
             header: color(&appearance.header_color, fallback.header),
             body: color(&appearance.body_color, fallback.body),
             title: color(&appearance.title_color, fallback.title),
+            border: color(&appearance.border_color, fallback.border),
+            label: color(&appearance.label_color, fallback.label),
             header_alpha: appearance.header_opacity,
             body_alpha: appearance.body_opacity,
+            rounded: appearance.rounded,
         })
     });
 }
 
 fn current_style() -> Style {
     STYLE.with(Cell::get)
+}
+
+pub fn label_color() -> u32 {
+    current_style().label
+}
+
+pub const RADIUS: i32 = 8;
+
+pub fn body_region(width: i32, height: i32) -> HRGN {
+    unsafe {
+        if current_style().rounded {
+            CreateRoundRectRgn(0, -2 * RADIUS, width + 1, height + 1, 2 * RADIUS, 2 * RADIUS)
+        } else {
+            CreateRectRgn(0, -1, width, height)
+        }
+    }
+}
+
+pub fn frame_body(hdc: HDC, width: i32, height: i32, key: u32) {
+    let mut color = current_style().border;
+    if color == key {
+        color ^= 0x0001_0000;
+    }
+    unsafe {
+        let region = body_region(width, height);
+        let brush = CreateSolidBrush(COLORREF(color));
+        _ = FrameRgn(hdc, region, brush, 1, 1);
+        _ = DeleteObject(brush.into());
+        _ = DeleteObject(region.into());
+    }
+}
+
+fn client(hwnd: HWND) -> RECT {
+    let mut rect = RECT::default();
+    unsafe { _ = GetClientRect(hwnd, &mut rect) };
+    rect
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Edges {
+    All,
+    Sides,
+    Nothing,
 }
 
 pub fn body_color() -> u32 {
@@ -75,11 +134,12 @@ pub struct GroupWindows {
 pub fn register_classes(instance: HINSTANCE) {
     unsafe {
         let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
-        for (name, proc_) in [
-            (w!("CorralHeader"), header_proc as unsafe extern "system" fn(_, _, _, _) -> _),
-            (w!("CorralBody"), body_proc),
+        for (name, proc_, style) in [
+            (w!("CorralHeader"), header_proc as unsafe extern "system" fn(_, _, _, _) -> _, CS_DBLCLKS),
+            (w!("CorralBody"), body_proc, Default::default()),
         ] {
             let class = WNDCLASSW {
+                style,
                 lpfnWndProc: Some(proc_),
                 hInstance: instance,
                 lpszClassName: name,
@@ -180,6 +240,7 @@ impl GroupWindows {
                 SWP_NOACTIVATE,
             );
         }
+        self.reshape();
     }
 
     pub fn set_open(&self, open: bool) {
@@ -188,6 +249,31 @@ impl GroupWindows {
             _ = ShowWindow(self.body, command);
             if let Some(glass) = self.glass {
                 _ = ShowWindow(glass, command);
+            }
+        }
+        self.reshape();
+    }
+
+    fn reshape(&self) {
+        let rounded = current_style().rounded;
+        let width = client(self.header).right;
+        let body = client(self.body).bottom;
+        let open = self.is_open();
+        let r = 2 * RADIUS;
+        unsafe {
+            if !rounded {
+                SetWindowRgn(self.header, None, true);
+                SetWindowRgn(self.body, None, true);
+                if let Some(glass) = self.glass {
+                    SetWindowRgn(glass, None, true);
+                }
+                return;
+            }
+            let header_bottom = if open { HEADER_HEIGHT + r } else { HEADER_HEIGHT + 1 };
+            SetWindowRgn(self.header, Some(CreateRoundRectRgn(0, 0, width + 1, header_bottom, r, r)), true);
+            SetWindowRgn(self.body, Some(body_region(width, body)), true);
+            if let Some(glass) = self.glass {
+                SetWindowRgn(glass, Some(body_region(width, body)), true);
             }
         }
     }
@@ -200,6 +286,7 @@ impl GroupWindows {
             _ = InvalidateRect(Some(self.header), None, false);
             _ = InvalidateRect(Some(self.body), None, false);
         }
+        self.reshape();
     }
 
     pub fn set_title(&self, text: &str) {
@@ -226,6 +313,7 @@ impl GroupWindows {
             }
             _ = SetWindowPos(self.body, None, x, y, group.width, height, flags);
         }
+        self.reshape();
     }
 
     pub fn set_marker(&self, group: &Group, collapsed: bool) {
@@ -258,7 +346,7 @@ unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
     unsafe {
         match msg {
             WM_PAINT => {
-                paint(hwnd, current_style().header, true);
+                paint(hwnd, current_style().header, true, Edges::All);
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
@@ -290,6 +378,14 @@ unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             }
             WM_CAPTURECHANGED => {
                 crate::end_drag();
+                LRESULT(0)
+            }
+            WM_LBUTTONDBLCLK => {
+                crate::header_double_click(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize);
+                LRESULT(0)
+            }
+            WM_RBUTTONUP => {
+                crate::header_menu(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -366,7 +462,7 @@ unsafe extern "system" fn body_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         match msg {
             WM_PAINT => {
-                paint(hwnd, current_style().body, false);
+                paint(hwnd, current_style().body, false, Edges::Sides);
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
@@ -377,7 +473,7 @@ unsafe extern "system" fn body_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     }
 }
 
-pub unsafe fn paint(hwnd: HWND, color: u32, with_title: bool) {
+pub unsafe fn paint(hwnd: HWND, color: u32, with_title: bool, edges: Edges) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
@@ -387,6 +483,28 @@ pub unsafe fn paint(hwnd: HWND, color: u32, with_title: bool) {
         let brush = CreateSolidBrush(COLORREF(color));
         FillRect(hdc, &rect, brush);
         _ = DeleteObject(brush.into());
+
+        if edges != Edges::Nothing {
+            let border = CreateSolidBrush(COLORREF(current_style().border));
+            let (l, t, r, b) = (rect.left, rect.top, rect.right, rect.bottom);
+            let region = CreateRectRgn(0, 0, 0, 0);
+            let shaped = current_style().rounded && GetWindowRgn(hwnd, region).0 > 1;
+            let mut lines = vec![RECT { left: l, top: b - 1, right: r, bottom: b }];
+            if shaped {
+                _ = FrameRgn(hdc, region, border, 1, 1);
+            } else {
+                lines.push(RECT { left: l, top: t, right: l + 1, bottom: b });
+                lines.push(RECT { left: r - 1, top: t, right: r, bottom: b });
+                if edges == Edges::All {
+                    lines.push(RECT { left: l, top: t, right: r, bottom: t + 1 });
+                }
+            }
+            for line in &lines {
+                FillRect(hdc, line, border);
+            }
+            _ = DeleteObject(region.into());
+            _ = DeleteObject(border.into());
+        }
 
         if with_title {
             let mut buf = [0u16; 256];

@@ -38,10 +38,42 @@ use crate::shell::{self, MenuChoice};
 
 pub const GLASS_KEY: COLORREF = COLORREF(0x0002_0103);
 const KEY_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 3.0 / 255.0, g: 1.0 / 255.0, b: 2.0 / 255.0, a: 1.0 };
-const HOVER_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.2, g: 0.21, b: 0.22, a: 1.0 };
-const SELECTED_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.3, g: 0.32, b: 0.35, a: 1.0 };
-const TEXT_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 const SHADOW_COLOR: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.75 };
+
+#[derive(Clone, Copy)]
+struct Palette {
+    text: D2D1_COLOR_F,
+    shadow: bool,
+    hover: D2D1_COLOR_F,
+    selected: D2D1_COLOR_F,
+}
+
+fn rgb(color: u32) -> (f32, f32, f32) {
+    let channel = |shift: u32| ((color >> shift) & 0xFF) as f32 / 255.0;
+    (channel(0), channel(8), channel(16))
+}
+
+fn luminance((r, g, b): (f32, f32, f32)) -> f32 {
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+fn palette() -> Palette {
+    let (r, g, b) = rgb(crate::group::label_color());
+    let body = rgb(crate::group::body_color());
+    let toward = if luminance(body) > 0.5 { 0.0 } else { 1.0 };
+    let mix = |amount: f32| D2D1_COLOR_F {
+        r: body.0 + (toward - body.0) * amount,
+        g: body.1 + (toward - body.1) * amount,
+        b: body.2 + (toward - body.2) * amount,
+        a: 1.0,
+    };
+    Palette {
+        text: D2D1_COLOR_F { r, g, b, a: 1.0 },
+        shadow: luminance((r, g, b)) > 0.5,
+        hover: mix(0.14),
+        selected: mix(0.26),
+    }
+}
 
 const CELL_WIDTH: f32 = 76.0;
 const CELL_HEIGHT: f32 = 96.0;
@@ -368,7 +400,8 @@ fn prepare(body: HWND, glass: HWND) -> Result<bool> {
                 target.BindDC(frame.dc, &RECT { left: 0, top: 0, right: width, bottom: height })?;
                 target.BeginDraw();
                 target.Clear(Some(&KEY_COLOR));
-                let brush = target.CreateSolidColorBrush(&TEXT_COLOR, None)?;
+                let palette = palette();
+                let brush = target.CreateSolidColorBrush(&palette.text, None)?;
                 let max_scroll = (metrics.content_height(shelf.entries.len()) - height as f32).max(0.0);
                 shelf.scroll = shelf.scroll.clamp(0.0, max_scroll);
                 for index in 0..shelf.entries.len() {
@@ -377,17 +410,18 @@ fn prepare(body: HWND, glass: HWND) -> Result<bool> {
                         continue;
                     }
                     let highlight = if shelf.selected == Some(index) {
-                        Some(SELECTED_COLOR)
+                        Some(palette.selected)
                     } else if shelf.hover == Some(index) {
-                        Some(HOVER_COLOR)
+                        Some(palette.hover)
                     } else {
                         None
                     };
                     let entry = &mut shelf.entries[index];
                     let bitmap = entry_bitmap(target, entry, generation);
-                    draw_entry(target, &brush, &format, &metrics, entry, bitmap.as_ref(), cell, highlight);
+                    draw_entry(target, &brush, &format, &metrics, &palette, entry, bitmap.as_ref(), cell, highlight);
                 }
                 target.EndDraw(None, None)?;
+                crate::group::frame_body(frame.dc, width, height, GLASS_KEY.0);
             }
             shelf.dirty = false;
             Ok(())
@@ -416,6 +450,7 @@ fn draw_entry(
     brush: &ID2D1SolidColorBrush,
     format: &IDWriteTextFormat,
     metrics: &Metrics,
+    palette: &Palette,
     entry: &Entry,
     bitmap: Option<&ID2D1Bitmap>,
     cell: D2D_RECT_F,
@@ -445,9 +480,11 @@ fn draw_entry(
         let line = FONT_SIZE * s * 1.34;
         let text = D2D_RECT_F { left: cell.left + 3.0 * s, top, right: cell.right - 3.0 * s, bottom: top + line * LABEL_LINES };
         let shadow = D2D_RECT_F { left: text.left + s, top: text.top + s, right: text.right + s, bottom: text.bottom + s };
-        brush.SetColor(&SHADOW_COLOR);
-        target.DrawText(&entry.label, format, &shadow, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-        brush.SetColor(&TEXT_COLOR);
+        if palette.shadow {
+            brush.SetColor(&SHADOW_COLOR);
+            target.DrawText(&entry.label, format, &shadow, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+        }
+        brush.SetColor(&palette.text);
         target.DrawText(&entry.label, format, &text, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
     }
 }
@@ -474,7 +511,7 @@ pub unsafe extern "system" fn shelf_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
         }
         match msg {
             WM_PAINT => {
-                crate::group::paint(hwnd, crate::group::body_color(), false);
+                crate::group::paint(hwnd, crate::group::body_color(), false, crate::group::Edges::Nothing);
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),

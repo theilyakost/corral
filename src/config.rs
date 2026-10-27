@@ -17,10 +17,13 @@ pub struct Appearance {
     pub header_color: String,
     pub body_color: String,
     pub title_color: String,
+    pub border_color: String,
+    pub label_color: String,
     pub header_opacity: u8,
     pub body_opacity: u8,
     pub animate: bool,
     pub hover_open: bool,
+    pub rounded: bool,
 }
 
 impl Default for Appearance {
@@ -29,10 +32,13 @@ impl Default for Appearance {
             header_color: "#1A1C20".into(),
             body_color: "#101214".into(),
             title_color: "#F0F0F0".into(),
+            border_color: "#4A525E".into(),
+            label_color: "#FFFFFF".into(),
             header_opacity: 215,
             body_opacity: 110,
             animate: true,
             hover_open: true,
+            rounded: true,
         }
     }
 }

@@ -8,8 +8,10 @@ mod drop;
 mod group;
 mod icon;
 mod layout;
+mod rename;
 mod settings;
 mod shelf;
+mod themes;
 mod shell;
 mod watcher;
 
@@ -26,7 +28,7 @@ use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, ShellExecuteW, Shell_NotifyIconW};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetMessageW, IsDialogMessageW, WindowFromPoint, KillTimer, MB_ICONERROR, MB_ICONWARNING, WM_LBUTTONUP,
+    GetCursorPos, GetMessageW, IDYES, MF_CHECKED, IsDialogMessageW, MB_ICONQUESTION, MB_YESNO, WindowFromPoint, KillTimer, MB_ICONERROR, MB_ICONWARNING, WM_LBUTTONUP,
     MF_SEPARATOR, MF_STRING, MSG,
     MessageBoxW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow,
     SetTimer, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_DESTROY,
@@ -48,6 +50,11 @@ const TIMER_ATTACH: usize = 2;
 const TIMER_PEEK: usize = 3;
 const TIMER_ANIMATE: usize = 4;
 const TIMER_DRAG_PREVIEW: usize = 5;
+const MENU_RENAME: usize = 1;
+const MENU_PLAQUE: usize = 2;
+const MENU_NEW: usize = 3;
+const MENU_REMOVE: usize = 4;
+const MENU_SETTINGS: usize = 5;
 const DRAG_PREVIEW_MS: u32 = 250;
 const OPEN_DURATION: Duration = Duration::from_millis(180);
 const CLOSE_DURATION: Duration = Duration::from_millis(140);
@@ -716,8 +723,69 @@ pub fn end_drag() {
             _ = config.save();
             schedule(TIMER_LAYOUT, 0);
         }
-        Some(Some((drag, _))) if drag.resize.is_none() => toggle_collapsed(drag.index),
         _ => {}
+    }
+}
+
+pub fn header_double_click(index: usize) {
+    if let Some(Some(group)) = with_app(|app| app.config.groups.get(index).cloned()) {
+        start_rename(index, &group);
+    }
+}
+
+fn start_rename(index: usize, group: &Group) {
+    let header = windows::Win32::Foundation::RECT {
+        left: group.x,
+        top: group.y,
+        right: group.x + group.width,
+        bottom: group.y + group::HEADER_HEIGHT,
+    };
+    rename::start(index, header, &group.name);
+}
+
+pub fn header_menu(index: usize) {
+    let Some(Some((group, owned))) = with_app(|app| Some((app.config.groups.get(index)?.clone(), app.agent.is_some())))
+    else {
+        return;
+    };
+    let Some(main) = with_app(|app| app.main) else { return };
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        _ = AppendMenuW(menu, MF_STRING, MENU_RENAME, w!("Переименовать"));
+        if owned {
+            let flags = if group.collapsed { MF_STRING | MF_CHECKED } else { MF_STRING };
+            _ = AppendMenuW(menu, flags, MENU_PLAQUE, w!("Режим плашки"));
+        }
+        _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        _ = AppendMenuW(menu, MF_STRING, MENU_NEW, w!("Новая группа"));
+        _ = AppendMenuW(menu, MF_STRING, MENU_REMOVE, w!("Удалить группу…"));
+        _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("Настройки…"));
+        let mut cursor = POINT::default();
+        _ = GetCursorPos(&mut cursor);
+        _ = SetForegroundWindow(main);
+        let command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, cursor.x, cursor.y, None, main, None);
+        _ = DestroyMenu(menu);
+        match command.0 as usize {
+            MENU_RENAME => start_rename(index, &group),
+            MENU_PLAQUE => toggle_collapsed(index),
+            MENU_NEW => {
+                add_group();
+                settings::refresh();
+            }
+            MENU_REMOVE => confirm_remove(index, &group.name),
+            MENU_SETTINGS => open_settings(),
+            _ => {}
+        }
+    }
+}
+
+fn confirm_remove(index: usize, name: &str) {
+    let question = format!("Удалить группу «{name}»?\n\nФайлы на рабочем столе останутся на месте.");
+    let answer = unsafe { MessageBoxW(None, &HSTRING::from(question), w!("Corral"), MB_YESNO | MB_ICONQUESTION) };
+    if answer == IDYES {
+        remove_group(index);
+        settings::refresh();
     }
 }
 
