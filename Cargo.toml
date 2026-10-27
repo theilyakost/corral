@@ -7,6 +7,7 @@ edition = "2024"
 corral-agent = { path = "agent" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+windows-core = "0.61"
 windows = { version = "0.61.1", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
@@ -18,6 +19,7 @@ windows = { version = "0.61.1", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",

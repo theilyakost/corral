@@ -35,12 +35,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, Interface, PCWSTR, PWSTR, Result, w};
 
-use crate::protocol::{self, CMD_DETACH, CMD_SET_HIDDEN, CMD_SET_OWNER};
+use crate::protocol::{self, CMD_DETACH, CMD_DRAG_BEGIN, CMD_DRAG_END, CMD_SET_HIDDEN, CMD_SET_OWNER};
 
 const SUBCLASS_ID: usize = 0xC0AA;
 const WM_OWNER_GONE: u32 = WM_APP + 1;
 
-struct ThreadBound<T>(T);
+pub(crate) struct ThreadBound<T>(pub(crate) T);
 
 unsafe impl<T> Sync for ThreadBound<T> {}
 
@@ -138,7 +138,7 @@ unsafe fn shell_view() -> Result<(IFolderView2, IShellFolder)> {
     }
 }
 
-fn is_hidden(index: usize) -> bool {
+pub(crate) fn is_hidden(index: usize) -> bool {
     let Ok(state) = STATE.0.try_borrow() else { return false };
     let Some(state) = state.as_ref() else { return false };
     if state.hidden.is_empty() {
@@ -290,6 +290,13 @@ unsafe fn command(data: &COPYDATASTRUCT) {
             let pid = words[0] as u32 | (words[1] as u32) << 16;
             unsafe { watch_owner(pid) };
         }
+        CMD_DRAG_BEGIN => {
+            let views = STATE.0.try_borrow().ok().and_then(|s| s.as_ref().map(|s| (s.def_view, s.list_view)));
+            if let Some((def_view, list_view)) = views {
+                unsafe { crate::drag::begin(def_view, list_view) };
+            }
+        }
+        CMD_DRAG_END => unsafe { crate::drag::end() },
         CMD_DETACH => unsafe { detach() },
         _ => {}
     }
@@ -330,6 +337,7 @@ unsafe extern "system" fn owner_thread(context: *mut c_void) -> u32 {
 }
 
 unsafe fn detach() {
+    unsafe { crate::drag::end() };
     let Some(state) = STATE.0.try_borrow_mut().ok().and_then(|mut s| s.take()) else { return };
     unsafe {
         _ = RemoveWindowSubclass(state.def_view, Some(def_view_proc), SUBCLASS_ID);

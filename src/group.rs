@@ -5,7 +5,8 @@ use windows::Win32::Graphics::Gdi::{
     FW_SEMIBOLD, FillRect, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode,
     SetTextColor, TRANSPARENT,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
+use windows::Win32::System::SystemServices::MK_LBUTTON;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetCapture, ReleaseCapture, SetCapture, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect, GetCursorPos,
     GetWindowLongPtrW, GetWindowTextW, HTCLIENT, HTTRANSPARENT, HWND_TOP, IDC_ARROW, IDC_SIZEALL, IDC_SIZENS,
@@ -125,6 +126,8 @@ impl GroupWindows {
             };
             SetWindowLongPtrW(header, GWLP_USERDATA, index as isize);
             SetWindowLongPtrW(body, GWLP_USERDATA, index as isize);
+            crate::drop::register(header, index, true);
+            crate::drop::register(body, index, false);
             _ = SetLayeredWindowAttributes(header, COLORREF(0), current_style().header_alpha, LWA_ALPHA);
             _ = SetLayeredWindowAttributes(body, COLORREF(0), current_style().body_alpha, LWA_ALPHA);
             let glass = if owned {
@@ -160,6 +163,9 @@ impl GroupWindows {
             _ = ScreenToClient(self.host, &mut origin);
             _ = SetWindowPos(self.header, Some(HWND_TOP), origin.x, origin.y, group.width, HEADER_HEIGHT, SWP_NOACTIVATE);
             let (width, height) = (group.width, (group.height - HEADER_HEIGHT).max(0));
+            if self.glass.is_some() {
+                crate::shelf::set_extent(self.body, width, height);
+            }
             if let Some(glass) = self.glass {
                 _ = SetWindowPos(glass, Some(self.header), origin.x, origin.y + HEADER_HEIGHT, width, height, SWP_NOACTIVATE);
             }
@@ -236,6 +242,8 @@ impl GroupWindows {
     }
 
     pub fn destroy(&self) {
+        crate::drop::revoke(self.header);
+        crate::drop::revoke(self.body);
         unsafe {
             _ = DestroyWindow(self.header);
             _ = DestroyWindow(self.body);
@@ -260,13 +268,20 @@ unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 LRESULT(1)
             }
             WM_LBUTTONDOWN => {
-                crate::begin_drag(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize);
                 SetCapture(hwnd);
+                crate::begin_drag(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize);
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
-                crate::hover_header(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize);
-                crate::drag_to_cursor();
+                if GetCapture() == hwnd {
+                    if released(wparam) {
+                        _ = ReleaseCapture();
+                    } else {
+                        crate::drag_to_cursor();
+                    }
+                } else {
+                    crate::hover_header(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize);
+                }
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
@@ -299,7 +314,11 @@ fn grip_under_cursor(hwnd: HWND) -> Option<(bool, bool)> {
     grip_at(hwnd, point)
 }
 
-pub unsafe fn grip_message(hwnd: HWND, msg: u32, lparam: LPARAM) -> Option<LRESULT> {
+fn released(wparam: WPARAM) -> bool {
+    wparam.0 & MK_LBUTTON.0 as usize == 0 || unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0
+}
+
+pub unsafe fn grip_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     unsafe {
         let captured = GetCapture() == hwnd;
         match msg {
@@ -315,12 +334,16 @@ pub unsafe fn grip_message(hwnd: HWND, msg: u32, lparam: LPARAM) -> Option<LRESU
             WM_LBUTTONDOWN => {
                 let point = POINT { x: (lparam.0 & 0xFFFF) as i16 as i32, y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 };
                 let (right, bottom) = grip_at(hwnd, point)?;
-                crate::begin_resize(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize, right, bottom);
                 SetCapture(hwnd);
+                crate::begin_resize(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize, right, bottom);
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE if captured => {
-                crate::drag_to_cursor();
+                if released(wparam) {
+                    _ = ReleaseCapture();
+                } else {
+                    crate::drag_to_cursor();
+                }
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP if captured => {
@@ -338,7 +361,7 @@ pub unsafe fn grip_message(hwnd: HWND, msg: u32, lparam: LPARAM) -> Option<LRESU
 
 unsafe extern "system" fn body_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
-        if let Some(result) = grip_message(hwnd, msg, lparam) {
+        if let Some(result) = grip_message(hwnd, msg, wparam, lparam) {
             return result;
         }
         match msg {

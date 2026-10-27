@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use corral_agent::protocol::{self, CMD_DETACH, CMD_SET_HIDDEN, CMD_SET_OWNER};
+use corral_agent::protocol::{self, CMD_DETACH, CMD_DRAG_BEGIN, CMD_DRAG_END, CMD_SET_HIDDEN, CMD_SET_OWNER};
 use windows::Win32::Foundation::{FreeLibrary, HMODULE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -74,6 +74,10 @@ impl Agent {
             self.send(CMD_SET_HIDDEN, &protocol::encode_names(&names));
             self.hidden = names;
         }
+    }
+
+    pub fn set_dragging(&self, dragging: bool) {
+        self.send(if dragging { CMD_DRAG_BEGIN } else { CMD_DRAG_END }, &[]);
     }
 
     fn send(&self, command: usize, data: &[u16]) {

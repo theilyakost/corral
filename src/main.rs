@@ -4,6 +4,7 @@ mod agent;
 mod autostart;
 mod config;
 mod desktop;
+mod drop;
 mod group;
 mod icon;
 mod layout;
@@ -19,13 +20,13 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM,
 };
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, ShellExecuteW, Shell_NotifyIconW};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetMessageW, IsDialogMessageW, KillTimer, MB_ICONERROR, MB_ICONWARNING, WM_LBUTTONUP,
+    GetCursorPos, GetMessageW, IsDialogMessageW, WindowFromPoint, KillTimer, MB_ICONERROR, MB_ICONWARNING, WM_LBUTTONUP,
     MF_SEPARATOR, MF_STRING, MSG,
     MessageBoxW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow,
     SetTimer, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_DESTROY,
@@ -46,6 +47,8 @@ const TIMER_LAYOUT: usize = 1;
 const TIMER_ATTACH: usize = 2;
 const TIMER_PEEK: usize = 3;
 const TIMER_ANIMATE: usize = 4;
+const TIMER_DRAG_PREVIEW: usize = 5;
+const DRAG_PREVIEW_MS: u32 = 250;
 const OPEN_DURATION: Duration = Duration::from_millis(180);
 const CLOSE_DURATION: Duration = Duration::from_millis(140);
 const DRAG_THRESHOLD: i32 = 4;
@@ -66,6 +69,7 @@ struct App {
     drag: Option<Drag>,
     retries: u32,
     agent: Option<Agent>,
+    grid: Option<Grid>,
     peek: Option<usize>,
     animations: Vec<Animation>,
 }
@@ -101,6 +105,7 @@ impl App {
 
 struct Arranged {
     moved: usize,
+    grid: Grid,
     members: Vec<Vec<(String, IShellItem)>>,
 }
 
@@ -147,7 +152,7 @@ fn handles() -> Option<(HWND, HWND, HWND)> {
 
 fn main() {
     unsafe {
-        _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        _ = OleInitialize(None);
 
         let guard = CreateMutexW(None, true, w!("Local\\CorralSingleInstance"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
@@ -184,7 +189,7 @@ fn main() {
         };
 
         APP.with(|cell| {
-            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0, agent: None, peek: None, animations: Vec::new() });
+            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0, agent: None, grid: None, peek: None, animations: Vec::new() });
         });
         add_tray_icon(main);
         watcher::watch_desktop(main, WM_APP_DESKTOP_CHANGED);
@@ -297,6 +302,77 @@ pub fn set_rules(index: usize, rules: Vec<String>) {
     if let Some(Some(())) = changed {
         save_config();
         layout_icons();
+    }
+}
+
+pub fn drag_member(shelf: HWND, index: usize, name: &str, item: &IShellItem) {
+    with_app(|app| app.agent.as_ref().map(|a| a.set_dragging(true)));
+    let dropped = drop::drag_item(shelf, item);
+    with_app(|app| app.agent.as_ref().map(|a| a.set_dragging(false)));
+    if dropped {
+        dragged_out(index, name);
+    }
+}
+
+fn dragged_out(index: usize, name: &str) {
+    let mut cursor = POINT::default();
+    unsafe { _ = GetCursorPos(&mut cursor) };
+    let Some((_, def_view, list_view)) = handles() else { return };
+    let under = unsafe { WindowFromPoint(cursor) };
+    if under != list_view && under != def_view {
+        return;
+    }
+    if !drop::desktop_dirs().iter().any(|dir| dir.join(name).exists()) {
+        return;
+    }
+    let Some(groups) = with_app(|app| app.layout_groups()) else { return };
+    let placed = DESKTOP.with(|cell| {
+        let Ok(desktop) = cell.try_borrow() else { return false };
+        let Some(desktop) = desktop.as_ref() else { return false };
+        let Ok(items) = desktop.items() else { return false };
+        let Ok(spacing) = desktop.spacing() else { return false };
+        let on_icon = items.iter().any(|i| {
+            config::group_of(&groups, &i.name).is_none()
+                && (i.position.x..i.position.x + spacing.x).contains(&cursor.x)
+                && (i.position.y..i.position.y + spacing.y).contains(&cursor.y)
+        });
+        if on_icon {
+            return false;
+        }
+        let grid = Grid::detect(items.iter().map(|i| i.position), spacing);
+        let Some(item) = items.iter().find(|i| i.name == name) else { return false };
+        let taken: Vec<POINT> = items.iter().filter(|i| i.name != name).map(|i| i.position).collect();
+        let area = desktop::work_area(cursor);
+        if let Some(target) = layout::nearest_free_cell(cursor, grid, &taken, &groups, area) {
+            _ = desktop.position(&[(item, target)]);
+        }
+        true
+    });
+    if !placed {
+        return;
+    }
+    with_app(|app| {
+        app.config.take_out(index, name);
+        app.retries = 0;
+    });
+    save_config();
+    layout_icons();
+}
+
+pub fn put_into_group(index: usize, names: Vec<String>) {
+    let changed = with_app(|app| {
+        if index >= app.config.groups.len() {
+            return false;
+        }
+        for name in &names {
+            app.config.put(index, name);
+        }
+        true
+    });
+    if changed == Some(true) {
+        save_config();
+        with_app(|app| app.retries = 0);
+        schedule(TIMER_LAYOUT, 50);
     }
 }
 
@@ -418,6 +494,7 @@ fn layout_icons() {
     let result = result.map(|r| {
         r.map(|arranged| {
             arranged.map(|arranged| {
+                with_app(|app| app.grid = Some(arranged.grid));
                 if owned {
                     show_members(arranged.members);
                 }
@@ -464,7 +541,7 @@ fn arrange(desktop: &Desktop, groups: &[Group], owned: bool) -> windows::core::R
             list.sort_by_key(|(name, _)| name.to_lowercase());
         }
     }
-    Ok(Arranged { moved, members })
+    Ok(Arranged { moved, grid, members })
 }
 
 fn show_members(members: Vec<Vec<(String, IShellItem)>>) {
@@ -533,13 +610,14 @@ fn begin(index: usize, resize: Option<(bool, bool)>) {
     unsafe { _ = GetCursorPos(&mut cursor) };
     with_app(|app| {
         if let Some(group) = app.config.groups.get(index) {
-            app.drag = Some(Drag { index, cursor, start: Frame::of(group), resize, moved: false });
+            let area = desktop::work_area(POINT { x: group.x + group.width / 2, y: group.y + group::HEADER_HEIGHT / 2 });
+            let start = layout::trim_group(Frame::of(group), app.grid, area);
+            app.drag = Some(Drag { index, cursor, start, resize, moved: false });
         }
     });
-    let snapshot = take_snapshot();
     SNAPSHOT.with(|cell| {
         if let Ok(mut current) = cell.try_borrow_mut() {
-            *current = snapshot;
+            *current = None;
         }
     });
 }
@@ -547,8 +625,8 @@ fn begin(index: usize, resize: Option<(bool, bool)>) {
 pub fn drag_to_cursor() {
     let mut cursor = POINT::default();
     unsafe { _ = GetCursorPos(&mut cursor) };
-    let grid = SNAPSHOT.with(|cell| cell.try_borrow().ok().and_then(|s| s.as_ref().map(|s| s.grid)));
     let moved = with_app(|app| {
+        let grid = app.grid;
         let drag = app.drag.as_mut()?;
         let (dx, dy) = (cursor.x - drag.cursor.x, cursor.y - drag.cursor.y);
         if !drag.moved && dx.abs() < DRAG_THRESHOLD && dy.abs() < DRAG_THRESHOLD {
@@ -575,15 +653,37 @@ pub fn drag_to_cursor() {
         fitted.apply(group);
         let group = group.clone();
         let windows = *app.windows.iter().find(|w| w.index == index)?;
-        Some((windows, group, app.layout_groups()))
+        Some((windows, group))
     });
-    let Some(Some((windows, group, groups))) = moved else { return };
+    let Some(Some((windows, group))) = moved else { return };
     windows.place(&group);
+    schedule(TIMER_DRAG_PREVIEW, DRAG_PREVIEW_MS);
+}
 
+fn drag_preview() {
+    let Some(Some((index, groups))) = with_app(|app| {
+        let drag = app.drag.as_ref().filter(|d| d.moved)?;
+        Some((drag.index, app.layout_groups()))
+    }) else {
+        return;
+    };
+    let Some(frame) = groups.get(index).map(Frame::of) else { return };
+    let missing = SNAPSHOT.with(|cell| cell.try_borrow().map(|s| s.is_none()).unwrap_or(false));
+    if missing {
+        let snapshot = take_snapshot();
+        SNAPSHOT.with(|cell| {
+            if let Ok(mut current) = cell.try_borrow_mut() {
+                *current = snapshot;
+            }
+        });
+    }
+    let still_dragging = with_app(|app| app.drag.as_ref().is_some_and(|d| d.index == index)) == Some(true);
+    if !still_dragging {
+        return;
+    }
     SNAPSHOT.with(|cell| {
         let Ok(mut snapshot) = cell.try_borrow_mut() else { return };
         let Some(snapshot) = snapshot.as_mut() else { return };
-        let frame = Frame::of(&group);
         if snapshot.applied == Some(frame) {
             return;
         }
@@ -599,6 +699,9 @@ pub fn drag_to_cursor() {
 }
 
 pub fn end_drag() {
+    if let Some(main) = with_app(|app| app.main) {
+        unsafe { _ = KillTimer(Some(main), TIMER_DRAG_PREVIEW) };
+    }
     SNAPSHOT.with(|cell| {
         if let Ok(mut snapshot) = cell.try_borrow_mut() {
             *snapshot = None;
@@ -611,7 +714,7 @@ pub fn end_drag() {
     match finished {
         Some(Some((drag, config))) if drag.moved => {
             _ = config.save();
-            layout_icons();
+            schedule(TIMER_LAYOUT, 0);
         }
         Some(Some((drag, _))) if drag.resize.is_none() => toggle_collapsed(drag.index),
         _ => {}
@@ -636,7 +739,7 @@ fn toggle_collapsed(index: usize) {
         schedule(TIMER_PEEK, 150);
     }
     _ = config.save();
-    layout_icons();
+    schedule(TIMER_LAYOUT, 0);
 }
 
 pub fn hover_header(index: usize) {
@@ -846,6 +949,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     TIMER_ATTACH => attach(),
                     TIMER_PEEK => check_peek(),
                     TIMER_ANIMATE => step_animations(),
+                    TIMER_DRAG_PREVIEW => drag_preview(),
                     _ => {}
                 }
                 LRESULT(0)

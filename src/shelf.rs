@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
     D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory,
-    ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
+    ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
@@ -19,17 +19,18 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, ClientToScreen, CreateCompatibleDC, CreateDIBSection,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, HDC, InvalidateRect, PAINTSTRUCT, SRCCOPY, SelectObject,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, HBITMAP, HDC, HGDIOBJ, InvalidateRect, PAINTSTRUCT, SRCCOPY,
+    SelectObject,
 };
 use windows::Win32::Graphics::Imaging::IWICBitmap;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{DragDetect, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::IShellItem;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTTRANSPARENT, MA_NOACTIVATE, WM_DESTROY,
     WM_ERASEBKGND, WM_NCHITTEST, WM_DRAWITEM, WM_INITMENUPOPUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM,
-    WM_MENUCHAR, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SIZE,
+    WM_MENUCHAR, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP,
 };
 use windows::core::{Result, w};
 
@@ -56,6 +57,52 @@ pub struct Entry {
     label: Vec<u16>,
     item: IShellItem,
     icon: Option<(i32, Option<IWICBitmap>)>,
+    bitmap: Option<(u64, ID2D1Bitmap)>,
+}
+
+struct Frame {
+    dc: HDC,
+    bitmap: HBITMAP,
+    old: HGDIOBJ,
+    width: i32,
+    height: i32,
+}
+
+impl Frame {
+    fn new(width: i32, height: i32) -> Option<Frame> {
+        unsafe {
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let dc = CreateCompatibleDC(None);
+            let mut bits = std::ptr::null_mut();
+            let Ok(bitmap) = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) else {
+                _ = DeleteDC(dc);
+                return None;
+            };
+            let old = SelectObject(dc, bitmap.into());
+            Some(Frame { dc, bitmap, old, width, height })
+        }
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.old);
+            _ = DeleteObject(self.bitmap.into());
+            _ = DeleteDC(self.dc);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -66,12 +113,16 @@ struct Shelf {
     selected: Option<usize>,
     scroll: f32,
     tracking: bool,
+    extent: (i32, i32),
+    frame: Option<Frame>,
+    dirty: bool,
 }
 
 struct Graphics {
     target: ID2D1DCRenderTarget,
     write: IDWriteFactory,
     formats: Vec<(u32, IDWriteTextFormat)>,
+    generation: u64,
 }
 
 struct Metrics {
@@ -85,6 +136,7 @@ thread_local! {
     static SHELVES: RefCell<HashMap<isize, Shelf>> = RefCell::new(HashMap::new());
     static GRAPHICS: RefCell<Option<Graphics>> = const { RefCell::new(None) };
     static SPACING: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
+    static GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
 fn with_shelf<R>(hwnd: HWND, f: impl FnOnce(&mut Shelf) -> R) -> Option<R> {
@@ -96,7 +148,21 @@ pub fn set_spacing(spacing: POINT) {
 }
 
 pub fn register(body: HWND, glass: HWND) {
-    SHELVES.with(|cell| _ = cell.borrow_mut().insert(body.0 as isize, Shelf { glass, ..Default::default() }));
+    SHELVES.with(|cell| _ = cell.borrow_mut().insert(body.0 as isize, Shelf { glass, dirty: true, ..Default::default() }));
+}
+
+pub fn set_extent(body: HWND, width: i32, height: i32) {
+    let changed = with_shelf(body, |shelf| {
+        let changed = shelf.extent != (width, height);
+        if changed {
+            shelf.extent = (width, height);
+            shelf.dirty = true;
+        }
+        changed
+    });
+    if changed == Some(true) {
+        render(body);
+    }
 }
 
 pub fn set_items(hwnd: HWND, items: Vec<(String, IShellItem)>) {
@@ -108,7 +174,7 @@ pub fn set_items(hwnd: HWND, items: Vec<(String, IShellItem)>) {
         .into_iter()
         .map(|(name, item)| {
             let label = if known.contains(&name) { Vec::new() } else { shell::label(&item).encode_utf16().collect() };
-            Entry { name, label, item, icon: None }
+            Entry { name, label, item, icon: None, bitmap: None }
         })
         .collect();
     with_shelf(hwnd, |shelf| {
@@ -132,6 +198,7 @@ fn load_icons(body: HWND, pixels: i32) {
         for (i, icon) in loaded {
             if let Some(entry) = shelf.entries.get_mut(i) {
                 entry.icon = Some((pixels, icon));
+                entry.bitmap = None;
             }
         }
     });
@@ -207,7 +274,11 @@ fn graphics() -> Result<()> {
             let target = factory.CreateDCRenderTarget(&properties)?;
             target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let write: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            *cell.borrow_mut() = Some(Graphics { target, write, formats: Vec::new() });
+            let generation = GENERATION.with(|g| {
+                g.set(g.get() + 1);
+                g.get()
+            });
+            *cell.borrow_mut() = Some(Graphics { target, write, formats: Vec::new(), generation });
             Ok(())
         }
     })
@@ -236,62 +307,68 @@ impl Graphics {
 }
 
 pub fn render(body: HWND) {
-    if let Some(glass) = with_shelf(body, |shelf| shelf.glass) {
+    if let Some(glass) = with_shelf(body, |shelf| {
+        shelf.dirty = true;
+        shelf.glass
+    }) {
         unsafe { _ = InvalidateRect(Some(glass), None, false) };
     }
 }
 
 fn paint_glass(glass: HWND, hdc: HDC) {
     let body = HWND(unsafe { GetWindowLongPtrW(glass, GWLP_USERDATA) } as _);
-    match graphics().and_then(|_| draw(body, glass, hdc)) {
-        Ok(true) => {}
-        Ok(false) => unsafe { _ = InvalidateRect(Some(glass), None, false) },
-        Err(_) => GRAPHICS.with(|cell| *cell.borrow_mut() = None),
+    let ready = match graphics().and_then(|_| prepare(body, glass)) {
+        Ok(ready) => ready,
+        Err(_) => {
+            GRAPHICS.with(|cell| *cell.borrow_mut() = None);
+            false
+        }
+    };
+    let (width, height) = client_size(glass);
+    let blitted = with_shelf(body, |shelf| match &shelf.frame {
+        Some(frame) if ready => unsafe {
+            _ = BitBlt(hdc, 0, 0, width.min(frame.width), height.min(frame.height), Some(frame.dc), 0, 0, SRCCOPY);
+            true
+        },
+        _ => false,
+    });
+    if !ready || blitted.is_none() {
+        unsafe { _ = InvalidateRect(Some(glass), None, false) };
     }
 }
 
-fn draw(body: HWND, glass: HWND, hdc: HDC) -> Result<bool> {
-    let (width, height) = client_size(glass);
+fn prepare(body: HWND, glass: HWND) -> Result<bool> {
+    let Some((dirty, extent)) = with_shelf(body, |shelf| {
+        let fits = shelf.frame.as_ref().is_some_and(|f| (f.width, f.height) == shelf.extent);
+        (shelf.dirty || !fits, shelf.extent)
+    }) else {
+        return Ok(false);
+    };
+    if !dirty {
+        return Ok(true);
+    }
+    let (width, height) = if extent.0 > 0 && extent.1 > 0 { extent } else { client_size(glass) };
     if width <= 0 || height <= 0 {
         return Ok(true);
     }
     let metrics = metrics(body, width as f32);
     load_icons(body, metrics.icon_pixels());
-    unsafe {
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width,
-                biHeight: -height,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let dc = CreateCompatibleDC(Some(hdc));
-        let mut bits = std::ptr::null_mut();
-        let bitmap = match CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) {
-            Ok(bitmap) => bitmap,
-            Err(e) => {
-                _ = DeleteDC(dc);
-                return Err(e);
+    GRAPHICS.with(|cell| {
+        let mut graphics = cell.borrow_mut();
+        let graphics = graphics.as_mut().ok_or_else(windows::core::Error::empty)?;
+        let format = graphics.format(metrics.scale)?;
+        let generation = graphics.generation;
+        let target = &graphics.target;
+        let drawn = with_shelf(body, |shelf| -> Result<()> {
+            if shelf.frame.as_ref().is_none_or(|f| (f.width, f.height) != (width, height)) {
+                shelf.frame = Frame::new(width, height);
             }
-        };
-        let old = SelectObject(dc, bitmap.into());
-
-        let result = GRAPHICS.with(|cell| {
-            let mut graphics = cell.borrow_mut();
-            let graphics = graphics.as_mut().ok_or_else(windows::core::Error::empty)?;
-            let format = graphics.format(metrics.scale)?;
-            let target = &graphics.target;
-            let rect = RECT { left: 0, top: 0, right: width, bottom: height };
-            target.BindDC(dc, &rect)?;
-            target.BeginDraw();
-            target.Clear(Some(&KEY_COLOR));
-            let brush = target.CreateSolidColorBrush(&TEXT_COLOR, None)?;
-            let drawn = with_shelf(body, |shelf| {
+            let Some(frame) = &shelf.frame else { return Err(windows::core::Error::empty()) };
+            unsafe {
+                target.BindDC(frame.dc, &RECT { left: 0, top: 0, right: width, bottom: height })?;
+                target.BeginDraw();
+                target.Clear(Some(&KEY_COLOR));
+                let brush = target.CreateSolidColorBrush(&TEXT_COLOR, None)?;
                 let max_scroll = (metrics.content_height(shelf.entries.len()) - height as f32).max(0.0);
                 shelf.scroll = shelf.scroll.clamp(0.0, max_scroll);
                 for index in 0..shelf.entries.len() {
@@ -306,20 +383,32 @@ fn draw(body: HWND, glass: HWND, hdc: HDC) -> Result<bool> {
                     } else {
                         None
                     };
-                    draw_entry(target, &brush, &format, &metrics, &shelf.entries[index], cell, highlight);
+                    let entry = &mut shelf.entries[index];
+                    let bitmap = entry_bitmap(target, entry, generation);
+                    draw_entry(target, &brush, &format, &metrics, entry, bitmap.as_ref(), cell, highlight);
                 }
-            });
-            target.EndDraw(None, None).map(|_| drawn.is_some())
+                target.EndDraw(None, None)?;
+            }
+            shelf.dirty = false;
+            Ok(())
         });
-
-        if result == Ok(true) {
-            _ = BitBlt(hdc, 0, 0, width, height, Some(dc), 0, 0, SRCCOPY);
+        match drawn {
+            Some(result) => result.map(|_| true),
+            None => Ok(false),
         }
-        SelectObject(dc, old);
-        _ = DeleteObject(bitmap.into());
-        _ = DeleteDC(dc);
-        result
+    })
+}
+
+fn entry_bitmap(target: &ID2D1DCRenderTarget, entry: &mut Entry, generation: u64) -> Option<ID2D1Bitmap> {
+    if let Some((built, bitmap)) = &entry.bitmap {
+        if *built == generation {
+            return Some(bitmap.clone());
+        }
     }
+    let Some((_, Some(icon))) = &entry.icon else { return None };
+    let bitmap = unsafe { target.CreateBitmapFromWicBitmap(icon, None).ok()? };
+    entry.bitmap = Some((generation, bitmap.clone()));
+    Some(bitmap)
 }
 
 fn draw_entry(
@@ -328,6 +417,7 @@ fn draw_entry(
     format: &IDWriteTextFormat,
     metrics: &Metrics,
     entry: &Entry,
+    bitmap: Option<&ID2D1Bitmap>,
     cell: D2D_RECT_F,
     highlight: Option<D2D1_COLOR_F>,
 ) {
@@ -342,15 +432,13 @@ fn draw_entry(
 
         let pixels = metrics.icon_pixels();
         let icon_top = cell.top + ICON_TOP * s;
-        if let Some((_, Some(icon))) = &entry.icon {
-            if let Ok(bitmap) = target.CreateBitmapFromWicBitmap(icon, None) {
-                let size = bitmap.GetPixelSize();
-                let (w, h) = (size.width as f32, size.height as f32);
-                let x = (cell.left + cell.right - w) / 2.0;
-                let y = icon_top + (pixels as f32 - h) / 2.0;
-                let dest = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
-                target.DrawBitmap(&bitmap, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
-            }
+        if let Some(bitmap) = bitmap {
+            let size = bitmap.GetPixelSize();
+            let (w, h) = (size.width as f32, size.height as f32);
+            let x = (cell.left + cell.right - w) / 2.0;
+            let y = icon_top + (pixels as f32 - h) / 2.0;
+            let dest = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
+            target.DrawBitmap(bitmap, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
         }
 
         let top = icon_top + pixels as f32 + LABEL_GAP * s;
@@ -376,7 +464,7 @@ fn entry(hwnd: HWND, index: usize) -> Option<(String, IShellItem)> {
 
 pub unsafe extern "system" fn shelf_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
-        if let Some(result) = crate::group::grip_message(hwnd, msg, lparam) {
+        if let Some(result) = crate::group::grip_message(hwnd, msg, wparam, lparam) {
             return result;
         }
         if matches!(msg, WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR) {
@@ -390,10 +478,6 @@ pub unsafe extern "system" fn shelf_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
-            WM_SIZE => {
-                render(hwnd);
-                LRESULT(0)
-            }
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
             WM_MOUSEMOVE => {
                 let index = hit(hwnd, lparam);
@@ -420,6 +504,13 @@ pub unsafe extern "system" fn shelf_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             WM_LBUTTONDOWN => {
                 let index = hit(hwnd, lparam);
                 set_state(hwnd, |shelf| std::mem::replace(&mut shelf.selected, index) != index);
+                let mut at = POINT { x: (lparam.0 & 0xFFFF) as i16 as i32, y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 };
+                _ = ClientToScreen(hwnd, &mut at);
+                if let Some((name, item)) = index.and_then(|i| entry(hwnd, i)) {
+                    if DragDetect(hwnd, at).as_bool() {
+                        crate::drag_member(hwnd, GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize, &name, &item);
+                    }
+                }
                 LRESULT(0)
             }
             WM_LBUTTONDBLCLK => {
