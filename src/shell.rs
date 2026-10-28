@@ -73,13 +73,17 @@ pub enum MenuChoice {
     Done,
 }
 
-pub fn context_menu(owner: HWND, item: &IShellItem, extra: &str, at: POINT) -> Option<MenuChoice> {
+pub fn context_menu(owner: HWND, item: &IShellItem, extra: Option<&str>, at: POINT) -> Option<MenuChoice> {
     unsafe {
         let menu: IContextMenu = item.BindToHandler(None, &BHID_SFUIObject).ok()?;
         let popup = CreatePopupMenu().ok()?;
-        _ = AppendMenuW(popup, MF_STRING, EXTRA_COMMAND as usize, &HSTRING::from(extra));
-        _ = AppendMenuW(popup, MF_SEPARATOR, 0, None);
-        if menu.QueryContextMenu(popup, 2, FIRST_COMMAND, LAST_COMMAND, CMF_NORMAL).is_err() {
+        let mut first = 0;
+        if let Some(extra) = extra {
+            _ = AppendMenuW(popup, MF_STRING, EXTRA_COMMAND as usize, &HSTRING::from(extra));
+            _ = AppendMenuW(popup, MF_SEPARATOR, 0, None);
+            first = 2;
+        }
+        if menu.QueryContextMenu(popup, first, FIRST_COMMAND, LAST_COMMAND, CMF_NORMAL).is_err() {
             _ = DestroyMenu(popup);
             return None;
         }

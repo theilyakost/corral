@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use corral_agent::protocol::{self, CMD_DETACH, CMD_DRAG_BEGIN, CMD_DRAG_END, CMD_SET_HIDDEN, CMD_SET_OWNER};
-use windows::Win32::Foundation::{FreeLibrary, HMODULE, HWND, LPARAM, WPARAM};
+use corral_agent::protocol::{
+    self, CMD_CONTEXT_MENU, CMD_DETACH, CMD_DRAG_BEGIN, CMD_DRAG_END, CMD_SET_HIDDEN, CMD_SET_OWNER,
+};
+use windows::Win32::Foundation::{FreeLibrary, HMODULE, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -74,6 +76,12 @@ impl Agent {
             self.send(CMD_SET_HIDDEN, &protocol::encode_names(&names));
             self.hidden = names;
         }
+    }
+
+    pub fn show_menu(&self, name: &str, at: POINT) {
+        let mut words = protocol::encode_point(at.x, at.y).to_vec();
+        words.extend(protocol::encode_names(&[name]));
+        self.send(CMD_CONTEXT_MENU, &words);
     }
 
     pub fn set_dragging(&self, dragging: bool) {

@@ -10,6 +10,7 @@ mod drop;
 mod group;
 mod icon;
 mod layout;
+mod portal;
 mod rename;
 mod settings;
 mod shelf;
@@ -30,7 +31,7 @@ use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, ShellExecuteW, Shell_NotifyIconW};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetMessageW, IDYES, MF_CHECKED, IsDialogMessageW, MB_ICONQUESTION, MB_YESNO, WindowFromPoint, KillTimer, MB_ICONERROR, MB_ICONWARNING, WM_LBUTTONUP,
+    GetCursorPos, GetMessageW, IDYES, WM_COPYDATA, MF_CHECKED, IsDialogMessageW, MB_ICONQUESTION, MB_YESNO, WindowFromPoint, KillTimer, MB_ICONERROR, MB_ICONWARNING, WM_LBUTTONUP,
     MF_SEPARATOR, MF_STRING, MSG,
     MessageBoxW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow,
     SetTimer, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_DESTROY,
@@ -47,16 +48,22 @@ use layout::{Frame, Grid, Icon};
 
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_DESKTOP_CHANGED: u32 = WM_APP + 2;
+const WM_APP_PORTAL_CHANGED: u32 = WM_APP + 3;
+const TIMER_LATE_LAYOUT: usize = 8;
+const TIMER_PORTALS: usize = 9;
+const LATE_LAYOUT_MS: u32 = 1500;
 const TIMER_LAYOUT: usize = 1;
 const TIMER_ATTACH: usize = 2;
 const TIMER_PEEK: usize = 3;
 const TIMER_ANIMATE: usize = 4;
 const TIMER_DRAG_PREVIEW: usize = 5;
+const TIMER_RENAME: usize = 7;
 const MENU_RENAME: usize = 1;
 const MENU_PLAQUE: usize = 2;
 const MENU_NEW: usize = 3;
 const MENU_REMOVE: usize = 4;
 const MENU_SETTINGS: usize = 5;
+const MENU_PORTAL: usize = 6;
 const DRAG_PREVIEW_MS: u32 = 250;
 const OPEN_DURATION: Duration = Duration::from_millis(180);
 const CLOSE_DURATION: Duration = Duration::from_millis(140);
@@ -79,6 +86,8 @@ struct App {
     retries: u32,
     agent: Option<Agent>,
     grid: Option<Grid>,
+    menu_point: Option<POINT>,
+    pending_rename: Option<String>,
     peek: Option<usize>,
     animations: Vec<Animation>,
 }
@@ -106,9 +115,13 @@ impl App {
     fn layout_groups(&self) -> Vec<Group> {
         let mut groups = self.config.groups.clone();
         if self.agent.is_none() {
-            groups.iter_mut().for_each(|g| g.collapsed = false);
+            groups.iter_mut().filter(|g| g.portal.is_none()).for_each(|g| g.collapsed = false);
         }
         groups
+    }
+
+    fn can_collapse(&self, index: usize) -> bool {
+        self.agent.is_some() || self.config.groups.get(index).is_some_and(|g| g.portal.is_some())
     }
 }
 
@@ -198,7 +211,7 @@ fn main() {
         };
 
         APP.with(|cell| {
-            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0, agent: None, grid: None, peek: None, animations: Vec::new() });
+            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0, agent: None, grid: None, menu_point: None, pending_rename: None, peek: None, animations: Vec::new() });
         });
         add_tray_icon(main);
         watcher::watch_desktop(main, WM_APP_DESKTOP_CHANGED);
@@ -314,7 +327,107 @@ pub fn set_rules(index: usize, rules: Vec<String>) {
     }
 }
 
+pub fn set_modern_menu(enabled: bool) {
+    with_app(|app| app.config.modern_menu = enabled);
+    save_config();
+}
+
+pub fn modern_menu(index: usize, name: &str, at: POINT) -> bool {
+    if with_app(|app| app.agent.is_some() && app.config.modern_menu) != Some(true) || portal_path(index).is_some() {
+        return false;
+    }
+    let placed = DESKTOP.with(|cell| {
+        let Ok(desktop) = cell.try_borrow() else { return false };
+        let Some(desktop) = desktop.as_ref() else { return false };
+        let Ok(items) = desktop.items() else { return false };
+        let Some(item) = items.iter().find(|i| i.name == name) else { return false };
+        desktop.position(&[(item, POINT { x: at.x - 38, y: at.y - 30 })]).is_ok()
+    });
+    if !placed {
+        return false;
+    }
+    if let Some((_, _, list_view)) = handles() {
+        let mut explorer = 0;
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(list_view, Some(&mut explorer));
+            _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(explorer);
+        }
+    }
+    with_app(|app| {
+        app.menu_point = Some(at);
+        app.agent.as_ref().map(|a| a.show_menu(name, at))
+    });
+    true
+}
+
+pub fn rename_file(old: &str, new: &str) {
+    let renamed = DESKTOP.with(|cell| {
+        let desktop = cell.try_borrow().ok()?;
+        let desktop = desktop.as_ref()?;
+        let items = desktop.items().ok()?;
+        let item = items.iter().find(|i| i.name == old)?;
+        Some(desktop.rename(item, new))
+    });
+    match renamed {
+        Some(Ok(file)) => {
+            with_app(|app| {
+                for group in &mut app.config.groups {
+                    for list in [&mut group.items, &mut group.exclude] {
+                        for entry in list.iter_mut().filter(|e| e.eq_ignore_ascii_case(old)) {
+                            *entry = file.clone();
+                        }
+                    }
+                }
+            });
+            save_config();
+            schedule(TIMER_LAYOUT, 200);
+        }
+        Some(Err(e)) => show_error(&format!("Не удалось переименовать «{old}»:\n{e}")),
+        None => {}
+    }
+}
+
+fn rename_request(name: &str) {
+    let editing = DESKTOP.with(|cell| {
+        let desktop = cell.try_borrow().ok()?;
+        let desktop = desktop.as_ref()?;
+        let items = desktop.items().ok()?;
+        desktop.editing_name(items.iter().find(|i| i.name == name)?).ok()
+    });
+    let Some(editing) = editing else { return };
+    let mut at = with_app(|app| app.menu_point).flatten().unwrap_or_default();
+    if at == POINT::default() {
+        unsafe { _ = GetCursorPos(&mut at) };
+    }
+    let rect = windows::Win32::Foundation::RECT { left: at.x - 90, top: at.y + 18, right: at.x + 90, bottom: at.y + 44 };
+    rename::start_for(rename::Target::File(name.to_string()), rect, &editing);
+}
+
+fn agent_event(data: &windows::Win32::System::DataExchange::COPYDATASTRUCT) {
+    let words = if data.lpData.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(data.lpData as *const u16, data.cbData as usize / 2) }
+    };
+    match data.dwData {
+        corral_agent::protocol::EVT_RENAME => {
+            if let Some(name) = corral_agent::protocol::decode_names(words).into_iter().next() {
+                if let Some(main) = with_app(|app| app.main) {
+                    with_app(|app| app.pending_rename = Some(name));
+                    unsafe { SetTimer(Some(main), TIMER_RENAME, 10, None) };
+                }
+            }
+        }
+        corral_agent::protocol::EVT_MENU_DONE => schedule(TIMER_LAYOUT, 300),
+        _ => {}
+    }
+}
+
 pub fn drag_member(shelf: HWND, index: usize, entry: usize, name: &str, item: &IShellItem) {
+    if portal_path(index).is_some() {
+        drop::drag_item(shelf, item);
+        return;
+    }
     let icons = visible_icon_cells();
     let views = handles().map(|(_, def_view, list_view)| (def_view, list_view));
     let classify = |cursor: POINT, under: HWND| {
@@ -522,9 +635,74 @@ fn rebuild_windows(host: HWND, def_view: HWND) {
     let created: Vec<GroupWindows> = groups
         .iter()
         .enumerate()
-        .filter_map(|(index, group)| GroupWindows::create(index, group, host, def_view, instance, owned).ok())
+        .filter_map(|(index, group)| {
+            let owned = owned || group.portal.is_some();
+            GroupWindows::create(index, group, host, def_view, instance, owned).ok()
+        })
         .collect();
-    with_app(|app| app.windows = created);
+    let main = with_app(|app| {
+        app.windows = created;
+        app.main
+    });
+    if let Some(main) = main {
+        for path in groups.iter().filter_map(|g| g.portal.as_deref()) {
+            portal::watch(path, main, WM_APP_PORTAL_CHANGED);
+        }
+    }
+}
+
+fn refresh_portals() {
+    let Some(portals) = with_app(|app| {
+        app.windows
+            .iter()
+            .filter_map(|w| Some((w.body, app.config.groups.get(w.index)?.portal.clone()?)))
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    for (body, path) in portals {
+        shelf::set_items(body, portal::items(&path));
+    }
+}
+
+pub fn portal_path(index: usize) -> Option<String> {
+    with_app(|app| app.config.groups.get(index)?.portal.clone()).flatten()
+}
+
+pub fn add_portal(path: String) -> Option<usize> {
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.clone());
+    let index = add_group()?;
+    with_app(|app| {
+        if let Some(group) = app.config.groups.get_mut(index) {
+            group.name = name;
+            group.portal = Some(path);
+        }
+    });
+    save_config();
+    rebuild_and_layout();
+    Some(index)
+}
+
+pub fn set_portal(index: usize, path: Option<String>) {
+    let changed = with_app(|app| {
+        let group = app.config.groups.get_mut(index)?;
+        (group.portal != path).then(|| group.portal = path)
+    });
+    if let Some(Some(())) = changed {
+        save_config();
+        rebuild_and_layout();
+    }
+}
+
+fn pick_portal() {
+    let owner = settings::window();
+    if let Some(path) = portal::pick_folder(owner) {
+        add_portal(path);
+        settings::refresh();
+    }
 }
 
 fn layout_icons() {
@@ -540,9 +718,7 @@ fn layout_icons() {
         r.map(|arranged| {
             arranged.map(|arranged| {
                 with_app(|app| app.grid = Some(arranged.grid));
-                if owned {
-                    show_members(arranged.members);
-                }
+                show_members(arranged.members, owned);
                 arranged.moved
             })
         })
@@ -571,6 +747,8 @@ fn layout_icons() {
 
 fn arrange(desktop: &Desktop, groups: &[Group], owned: bool) -> windows::core::Result<Arranged> {
     let mut items = desktop.items()?;
+    let dirs = drop::desktop_dirs();
+    items.retain(|i| i.name.starts_with("::") || dirs.iter().any(|d| d.join(&i.name).exists()));
     let grid = Grid::detect(items.iter().map(|i| i.position), desktop.spacing()?);
     let moved = apply(desktop, &mut items, grid, groups)?;
     let mut members = vec![Vec::new(); groups.len()];
@@ -589,22 +767,34 @@ fn arrange(desktop: &Desktop, groups: &[Group], owned: bool) -> windows::core::R
     Ok(Arranged { moved, grid, members })
 }
 
-fn show_members(members: Vec<Vec<(String, IShellItem)>>) {
+fn show_members(members: Vec<Vec<(String, IShellItem)>>, owned: bool) {
     let names: Vec<String> = members.iter().flatten().map(|(name, _)| name.clone()).collect();
-    let Some((agent, bodies)) =
-        with_app(|app| (app.agent.take(), app.windows.iter().map(|w| (w.index, w.body)).collect::<Vec<_>>()))
-    else {
+    let Some((agent, bodies)) = with_app(|app| {
+        let bodies: Vec<(usize, HWND, Option<String>)> = app
+            .windows
+            .iter()
+            .map(|w| (w.index, w.body, app.config.groups.get(w.index).and_then(|g| g.portal.clone())))
+            .collect();
+        (app.agent.take(), bodies)
+    }) else {
         return;
     };
     if let Some(mut agent) = agent {
         agent.set_hidden(names);
         with_app(|app| app.agent = Some(agent));
     }
-    for (index, list) in members.into_iter().enumerate() {
-        if let Some(&(_, body)) = bodies.iter().find(|(i, _)| *i == index) {
-            shelf::set_items(body, list);
+    let mut members = members;
+    for (index, body, portal) in bodies {
+        match portal {
+            Some(path) => shelf::set_items(body, portal::items(&path)),
+            None if owned => shelf::set_items(body, members.get_mut(index).map(std::mem::take).unwrap_or_default()),
+            None => {}
         }
     }
+}
+
+pub fn is_portal(index: usize) -> bool {
+    portal_path(index).is_some()
 }
 
 pub fn take_out(index: usize, name: &str) {
@@ -782,7 +972,7 @@ fn start_rename(index: usize, group: &Group) {
 }
 
 pub fn header_menu(index: usize) {
-    let Some(Some((group, owned))) = with_app(|app| Some((app.config.groups.get(index)?.clone(), app.agent.is_some())))
+    let Some(Some((group, owned))) = with_app(|app| Some((app.config.groups.get(index)?.clone(), app.can_collapse(index))))
     else {
         return;
     };
@@ -796,6 +986,7 @@ pub fn header_menu(index: usize) {
         }
         _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         _ = AppendMenuW(menu, MF_STRING, MENU_NEW, w!("Новая группа"));
+        _ = AppendMenuW(menu, MF_STRING, MENU_PORTAL, w!("Новый портал в папку…"));
         _ = AppendMenuW(menu, MF_STRING, MENU_REMOVE, w!("Удалить группу…"));
         _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("Настройки…"));
@@ -813,6 +1004,7 @@ pub fn header_menu(index: usize) {
             }
             MENU_REMOVE => confirm_remove(index, &group.name),
             MENU_SETTINGS => open_settings(),
+            MENU_PORTAL => pick_portal(),
             _ => {}
         }
     }
@@ -829,7 +1021,9 @@ fn confirm_remove(index: usize, name: &str) {
 
 fn toggle_collapsed(index: usize) {
     let changed = with_app(|app| {
-        app.agent.as_ref()?;
+        if !app.can_collapse(index) {
+            return None;
+        }
         let group = app.config.groups.get_mut(index)?;
         group.collapsed = !group.collapsed;
         let group = group.clone();
@@ -850,7 +1044,7 @@ fn toggle_collapsed(index: usize) {
 
 pub fn hover_header(index: usize) {
     let opened = with_app(|app| {
-        let collapsed = app.agent.is_some()
+        let collapsed = app.can_collapse(index)
             && app.config.appearance.hover_open
             && app.config.groups.get(index).is_some_and(|g| g.collapsed);
         if !collapsed || app.drag.is_some() || app.peek == Some(index) {
@@ -1046,6 +1240,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             WM_APP_DESKTOP_CHANGED => {
                 with_app(|app| app.retries = 0);
                 SetTimer(Some(hwnd), TIMER_LAYOUT, 400, None);
+                SetTimer(Some(hwnd), TIMER_LATE_LAYOUT, LATE_LAYOUT_MS, None);
+                LRESULT(0)
+            }
+            WM_APP_PORTAL_CHANGED => {
+                SetTimer(Some(hwnd), TIMER_PORTALS, 250, None);
                 LRESULT(0)
             }
             WM_TIMER => {
@@ -1056,9 +1255,20 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     TIMER_PEEK => check_peek(),
                     TIMER_ANIMATE => step_animations(),
                     TIMER_DRAG_PREVIEW => drag_preview(),
+                    TIMER_LATE_LAYOUT => layout_icons(),
+                    TIMER_PORTALS => refresh_portals(),
+                    TIMER_RENAME => {
+                        if let Some(Some(name)) = with_app(|app| app.pending_rename.take()) {
+                            rename_request(&name);
+                        }
+                    }
                     _ => {}
                 }
                 LRESULT(0)
+            }
+            WM_COPYDATA => {
+                agent_event(&*(lparam.0 as *const windows::Win32::System::DataExchange::COPYDATASTRUCT));
+                LRESULT(1)
             }
             WM_APP_TRAY => {
                 let event = (lparam.0 & 0xFFFF) as u32;

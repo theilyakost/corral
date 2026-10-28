@@ -23,11 +23,12 @@ struct GroupDrop {
     header: bool,
     helper: Option<IDropTargetHelper>,
     accepted: std::cell::Cell<bool>,
+    folder: std::cell::RefCell<Option<IDropTarget>>,
 }
 
 pub fn register(hwnd: HWND, index: usize, header: bool) {
     let helper = unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).ok() };
-    let target: IDropTarget = GroupDrop { hwnd, index, header, helper, accepted: Default::default() }.into();
+    let target: IDropTarget = GroupDrop { hwnd, index, header, helper, accepted: Default::default(), folder: Default::default() }.into();
     unsafe { _ = RegisterDragDrop(hwnd, &target) };
 }
 
@@ -128,10 +129,22 @@ fn point(pt: &POINTL) -> POINT {
 
 impl IDropTarget_Impl for GroupDrop_Impl {
     fn DragEnter(
-        &self, data: Ref<'_, IDataObject>, _keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT,
+        &self, data: Ref<'_, IDataObject>, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT,
     ) -> Result<()> {
-        self.accepted.set(!names(data.as_ref()).is_empty());
-        let shown = self.effect(effect);
+        let folder = crate::portal_path(self.index).and_then(|path| crate::portal::drop_target(&path));
+        let shown = match &folder {
+            Some(folder) => unsafe {
+                if folder.DragEnter(data.as_ref(), keys, *pt, effect).is_err() {
+                    *effect = DROPEFFECT_NONE;
+                }
+                *effect
+            },
+            None => {
+                self.accepted.set(!names(data.as_ref()).is_empty());
+                self.effect(effect)
+            }
+        };
+        *self.folder.borrow_mut() = folder;
         if let (Some(helper), Some(data)) = (&self.helper, data.as_ref()) {
             unsafe { _ = helper.DragEnter(self.hwnd, data, &point(pt), shown) };
         }
@@ -139,8 +152,17 @@ impl IDropTarget_Impl for GroupDrop_Impl {
         Ok(())
     }
 
-    fn DragOver(&self, _keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
-        let shown = self.effect(effect);
+    fn DragOver(&self, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+        let folder = self.folder.borrow().clone();
+        let shown = match folder {
+            Some(folder) => unsafe {
+                if folder.DragOver(keys, *pt, effect).is_err() {
+                    *effect = DROPEFFECT_NONE;
+                }
+                *effect
+            },
+            None => self.effect(effect),
+        };
         if let Some(helper) = &self.helper {
             unsafe { _ = helper.DragOver(&point(pt), shown) };
         }
@@ -149,13 +171,23 @@ impl IDropTarget_Impl for GroupDrop_Impl {
     }
 
     fn DragLeave(&self) -> Result<()> {
+        if let Some(folder) = self.folder.borrow_mut().take() {
+            unsafe { _ = folder.DragLeave() };
+        }
         if let Some(helper) = &self.helper {
             unsafe { _ = helper.DragLeave() };
         }
         Ok(())
     }
 
-    fn Drop(&self, data: Ref<'_, IDataObject>, _keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+    fn Drop(&self, data: Ref<'_, IDataObject>, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+        let folder = self.folder.borrow_mut().take();
+        if let Some(folder) = folder {
+            if let (Some(helper), Some(data)) = (&self.helper, data.as_ref()) {
+                unsafe { _ = helper.Drop(data, &point(pt), *effect) };
+            }
+            return unsafe { folder.Drop(data.as_ref(), keys, *pt, effect) };
+        }
         let names = names(data.as_ref());
         if let (Some(helper), Some(data)) = (&self.helper, data.as_ref()) {
             unsafe { _ = helper.Drop(data, &point(pt), shown_effect(*effect)) };

@@ -28,7 +28,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Graphics::Imaging::IWICBitmap;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{DragDetect, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    DragDetect, GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_SHIFT,
+};
 use windows::Win32::UI::Shell::IShellItem;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTTRANSPARENT, MA_NOACTIVATE, WM_DESTROY,
@@ -689,7 +691,13 @@ pub unsafe extern "system" fn shelf_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 let Some((name, item)) = entry(hwnd, index) else { return LRESULT(0) };
                 let mut at = POINT { x: (lparam.0 & 0xFFFF) as i16 as i32, y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 };
                 _ = ClientToScreen(hwnd, &mut at);
-                if let Some(MenuChoice::Extra) = shell::context_menu(hwnd, &item, "Убрать из группы", at) {
+                let group = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize;
+                let classic = GetKeyState(VK_SHIFT.0 as i32) < 0;
+                if !classic && crate::modern_menu(group, &name, at) {
+                    return LRESULT(0);
+                }
+                let extra = (!crate::is_portal(group)).then_some("Убрать из группы");
+                if let Some(MenuChoice::Extra) = shell::context_menu(hwnd, &item, extra, at) {
                     crate::take_out(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize, &name);
                 }
                 LRESULT(0)

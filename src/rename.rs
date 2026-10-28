@@ -17,8 +17,14 @@ use windows::core::{HSTRING, w};
 
 const SUBCLASS_ID: usize = 0xC0AB;
 
+#[derive(Clone)]
+pub enum Target {
+    Group(usize),
+    File(String),
+}
+
 thread_local! {
-    static ACTIVE: Cell<Option<(HWND, usize)>> = const { Cell::new(None) };
+    static ACTIVE: std::cell::RefCell<Option<(HWND, Target)>> = const { std::cell::RefCell::new(None) };
     static FONT: Cell<Option<HFONT>> = const { Cell::new(None) };
 }
 
@@ -34,6 +40,10 @@ fn font() -> HFONT {
 }
 
 pub fn start(index: usize, header: RECT, name: &str) {
+    start_for(Target::Group(index), header, name);
+}
+
+pub fn start_for(target: Target, header: RECT, name: &str) {
     finish(false);
     unsafe {
         let instance = GetModuleHandleW(None).unwrap_or_default();
@@ -47,7 +57,7 @@ pub fn start(index: usize, header: RECT, name: &str) {
         };
         SendMessageW(edit, WM_SETFONT, Some(WPARAM(font().0 as usize)), Some(LPARAM(1)));
         _ = SetWindowSubclass(edit, Some(edit_proc), SUBCLASS_ID, 0);
-        ACTIVE.with(|cell| cell.set(Some((edit, index))));
+        ACTIVE.with(|cell| *cell.borrow_mut() = Some((edit, target)));
         _ = SetForegroundWindow(edit);
         _ = SetFocus(Some(edit));
         SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
@@ -55,15 +65,20 @@ pub fn start(index: usize, header: RECT, name: &str) {
 }
 
 pub fn finish(commit: bool) {
-    let Some((edit, index)) = ACTIVE.with(|cell| cell.take()) else { return };
+    let Some((edit, target)) = ACTIVE.with(|cell| cell.borrow_mut().take()) else { return };
     unsafe {
         if commit {
             let mut buf = vec![0u16; GetWindowTextLengthW(edit) as usize + 1];
             let len = GetWindowTextW(edit, &mut buf) as usize;
             let name = String::from_utf16_lossy(&buf[..len]).trim().to_string();
             if !name.is_empty() {
-                crate::rename_group(index, &name);
-                crate::settings::refresh();
+                match target {
+                    Target::Group(index) => {
+                        crate::rename_group(index, &name);
+                        crate::settings::refresh();
+                    }
+                    Target::File(file) => crate::rename_file(&file, &name),
+                }
             }
         }
         _ = RemoveWindowSubclass(edit, Some(edit_proc), SUBCLASS_ID);

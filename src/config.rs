@@ -7,6 +7,8 @@ use std::path::PathBuf;
 pub struct Config {
     #[serde(default)]
     pub appearance: Appearance,
+    #[serde(default)]
+    pub modern_menu: bool,
     #[serde(default, rename = "group")]
     pub groups: Vec<Group>,
 }
@@ -72,6 +74,8 @@ pub struct Group {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub collapsed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portal: Option<String>,
 }
 
 impl Group {
@@ -90,6 +94,7 @@ impl Group {
             items: Vec::new(),
             exclude: Vec::new(),
             collapsed: false,
+            portal: None,
         }
     }
 
@@ -166,6 +171,7 @@ impl Config {
     fn starter() -> Config {
         Config {
             appearance: Appearance::default(),
+            modern_menu: false,
             groups: vec![
                 Group {
                     name: "Документы".into(),
@@ -191,10 +197,14 @@ impl Config {
 }
 
 pub fn group_of(groups: &[Group], file_name: &str) -> Option<usize> {
+    let collects = |g: &&Group| g.portal.is_none();
     groups
         .iter()
-        .position(|g| g.holds(file_name))
-        .or_else(|| groups.iter().position(|g| g.matches(file_name) && !g.rejects(file_name)))
+        .enumerate()
+        .filter(|(_, g)| collects(g))
+        .find(|(_, g)| g.holds(file_name))
+        .or_else(|| groups.iter().enumerate().filter(|(_, g)| collects(g)).find(|(_, g)| g.matches(file_name) && !g.rejects(file_name)))
+        .map(|(i, _)| i)
 }
 
 pub fn glob_match(pattern: &str, name: &str) -> bool {
@@ -269,6 +279,19 @@ width = 1
 height = 1
 "#).unwrap();
         assert_eq!(old.appearance, Appearance::default());
+    }
+
+    #[test]
+    fn portals_never_collect_desktop_icons() {
+        let mut config = Config::starter();
+        config.groups[0].portal = Some(r"C:\Work".into());
+        assert_eq!(config.group_of("notes.txt"), None);
+        assert_eq!(config.group_of("photo.png"), Some(1));
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("portal"));
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.groups[0].portal.as_deref(), Some(r"C:\Work"));
+        assert_eq!(back.groups[1].portal, None);
     }
 
     #[test]

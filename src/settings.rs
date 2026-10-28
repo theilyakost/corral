@@ -50,6 +50,11 @@ const ID_ROUNDED: i32 = 124;
 const ID_LABEL_COLOR: i32 = 125;
 const ID_LABEL_SWATCH: i32 = 126;
 const ID_THEME: i32 = 127;
+const ID_PORTAL: i32 = 128;
+const ID_RULES_LABEL: i32 = 129;
+const ID_MODERN_MENU: i32 = 130;
+const RULES_TEXT: &str = "Правила: маски файлов, по одной на строку (например *.pdf)";
+const PORTAL_TEXT: &str = "Портал: путь к папке, её содержимое показывается в группе";
 
 const CBS_DROPDOWNLIST: u32 = 0x0003;
 const CB_ADDSTRING: u32 = 0x0143;
@@ -62,7 +67,7 @@ const TBM_GETPOS: u32 = 0x0400;
 const TIMER_RULES: usize = 1;
 const RULES_DELAY_MS: u32 = 600;
 const WIDTH: i32 = 680;
-const HEIGHT: i32 = 616;
+const HEIGHT: i32 = 644;
 const GROUP_FIELDS: [i32; 4] = [ID_REMOVE, ID_NAME, ID_RULES, ID_COLLAPSED];
 
 struct Settings {
@@ -158,10 +163,11 @@ pub fn open(instance: HINSTANCE) {
         add(w!("LISTBOX"), "", WINDOW_STYLE(LBS_NOTIFY as u32) | WS_VSCROLL | WS_BORDER | WS_TABSTOP, none, ID_LIST, [16, 34, 200, 380]);
         add(w!("BUTTON"), "Добавить", button, none, ID_ADD, [16, 420, 96, 28]);
         add(w!("BUTTON"), "Удалить", button, none, ID_REMOVE, [120, 420, 96, 28]);
+        add(w!("BUTTON"), "Новый портал в папку…", button, none, ID_PORTAL, [16, 454, 200, 28]);
 
         add(w!("STATIC"), "Название", plain, none, -1, [236, 14, 428, 18]);
         add(w!("EDIT"), "", WINDOW_STYLE(ES_AUTOHSCROLL as u32) | WS_TABSTOP, WS_EX_CLIENTEDGE, ID_NAME, [236, 34, 428, 24]);
-        add(w!("STATIC"), "Правила: маски файлов, по одной на строку (например *.pdf)", plain, none, -1, [236, 68, 428, 18]);
+        add(w!("STATIC"), RULES_TEXT, plain, none, ID_RULES_LABEL, [236, 68, 428, 18]);
         let multiline = WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) as u32) | WS_VSCROLL | WS_TABSTOP;
         add(w!("EDIT"), "", multiline, WS_EX_CLIENTEDGE, ID_RULES, [236, 88, 428, 90]);
         add(w!("BUTTON"), "Режим плашки (только заголовок, раскрывается при наведении)", check, none, ID_COLLAPSED, [236, 186, 428, 22]);
@@ -195,6 +201,7 @@ pub fn open(instance: HINSTANCE) {
 
         add(w!("BUTTON"), "Прятать иконки в группах (агент в Проводнике)", check, none, ID_AGENT, [236, 548, 428, 22]);
         add(w!("BUTTON"), "Запускать при входе в Windows", check, none, ID_AUTOSTART, [236, 576, 428, 22]);
+        add(w!("BUTTON"), "Новое контекстное меню Windows 11 (эксперимент)", check, none, ID_MODERN_MENU, [236, 604, 428, 22]);
 
         if let Ok(themes) = GetDlgItem(Some(hwnd), ID_THEME) {
             let names = crate::themes::THEMES.iter().map(|t| t.name).chain([CUSTOM_THEME]);
@@ -295,6 +302,7 @@ pub fn refresh() {
     load_appearance(hwnd, &config.appearance);
     set_check(hwnd, ID_AGENT, crate::agent_enabled());
     set_check(hwnd, ID_AUTOSTART, crate::autostart::enabled());
+    set_check(hwnd, ID_MODERN_MENU, config.modern_menu);
     with_settings(|s| s.loading = false);
 }
 
@@ -306,7 +314,14 @@ fn load_group(hwnd: HWND, selected: Option<usize>) {
     enable(hwnd, ID_COLLAPSED, group.is_some() && crate::agent_enabled());
     let previous = with_settings(|s| std::mem::replace(&mut s.loading, true));
     set_text(hwnd, ID_NAME, group.as_ref().map_or("", |g| g.name.as_str()));
-    set_text(hwnd, ID_RULES, &group.as_ref().map_or(String::new(), |g| g.rules.join("\r\n")));
+    let portal = group.as_ref().and_then(|g| g.portal.clone());
+    set_text(hwnd, ID_RULES_LABEL, if portal.is_some() { PORTAL_TEXT } else { RULES_TEXT });
+    let rules = match &portal {
+        Some(path) => path.clone(),
+        None => group.as_ref().map_or(String::new(), |g| g.rules.join("\r\n")),
+    };
+    set_text(hwnd, ID_RULES, &rules);
+    enable(hwnd, ID_COLLAPSED, group.is_some() && (crate::agent_enabled() || portal.is_some()));
     set_check(hwnd, ID_COLLAPSED, group.as_ref().is_some_and(|g| g.collapsed));
     with_settings(|s| s.loading = previous.unwrap_or(false));
 }
@@ -376,7 +391,15 @@ fn loading() -> bool {
 fn flush_rules(hwnd: HWND) {
     unsafe { _ = KillTimer(Some(hwnd), TIMER_RULES) };
     let Some(index) = selected() else { return };
-    let rules = text(hwnd, ID_RULES).lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+    let value = text(hwnd, ID_RULES);
+    if crate::is_portal(index) {
+        let path = value.lines().map(str::trim).find(|l| !l.is_empty()).map(String::from);
+        if path.as_deref().is_some_and(|p| std::path::Path::new(p).is_dir()) {
+            crate::set_portal(index, path);
+        }
+        return;
+    }
+    let rules = value.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
     crate::set_rules(index, rules);
 }
 
@@ -395,6 +418,15 @@ fn command(hwnd: HWND, id: i32, code: u32) {
                 with_settings(|s| s.selected = Some(index));
             }
             refresh();
+        }
+        (ID_PORTAL, BN_CLICKED) => {
+            flush_rules(hwnd);
+            if let Some(path) = crate::portal::pick_folder(Some(hwnd)) {
+                if let Some(index) = crate::add_portal(path) {
+                    with_settings(|s| s.selected = Some(index));
+                }
+                refresh();
+            }
         }
         (ID_REMOVE, BN_CLICKED) => {
             let Some(index) = selected() else { return };
@@ -467,6 +499,7 @@ fn command(hwnd: HWND, id: i32, code: u32) {
             crate::set_agent(checked(hwnd, ID_AGENT));
             refresh();
         }
+        (ID_MODERN_MENU, BN_CLICKED) => crate::set_modern_menu(checked(hwnd, ID_MODERN_MENU)),
         (ID_AUTOSTART, BN_CLICKED) => {
             crate::set_autostart(checked(hwnd, ID_AUTOSTART));
             if window().is_some() {

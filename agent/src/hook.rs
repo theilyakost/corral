@@ -18,8 +18,8 @@ use windows::Win32::System::Threading::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_NOTIFYITEMDRAW, CDRF_SKIPDEFAULT, LVHITTESTINFO, LVIF_STATE,
-    LVIS_SELECTED, LVITEMW, LVM_GETITEMCOUNT, LVM_HITTEST, LVM_SETITEMSTATE, LVN_ITEMCHANGED, LVN_ITEMCHANGING,
-    NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMLISTVIEW,
+    LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_GETITEMCOUNT, LVM_HITTEST, LVM_SETITEMSTATE, LVN_BEGINLABELEDITW,
+    LVN_ITEMCHANGED, LVN_ITEMCHANGING, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMLISTVIEW, NMLVDISPINFOW,
 };
 use windows::Win32::UI::Shell::Common::STRRET;
 use windows::Win32::UI::Shell::{
@@ -29,16 +29,20 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, FindWindowW,
-    GetWindowThreadProcessId, HWND_MESSAGE, PostMessageW, RegisterClassW, SendMessageW, UnregisterClassW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_COPYDATA, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NOTIFY, WM_RBUTTONDOWN,
+    GetWindowThreadProcessId, HWND_MESSAGE, PostMessageW, RegisterClassW, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
+    SendMessageW, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_COPYDATA, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NOTIFY, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WNDCLASSW,
 };
 use windows::core::{HSTRING, Interface, PCWSTR, PWSTR, Result, w};
 
-use crate::protocol::{self, CMD_DETACH, CMD_DRAG_BEGIN, CMD_DRAG_END, CMD_SET_HIDDEN, CMD_SET_OWNER};
+use crate::protocol::{
+    self, CMD_CONTEXT_MENU, CMD_DETACH, CMD_DRAG_BEGIN, CMD_DRAG_END, CMD_SET_HIDDEN, CMD_SET_OWNER, EVT_MENU_DONE,
+    EVT_RENAME,
+};
 
 const SUBCLASS_ID: usize = 0xC0AA;
 const WM_OWNER_GONE: u32 = WM_APP + 1;
+const WM_SHOW_MENU: u32 = WM_APP + 2;
 
 pub(crate) struct ThreadBound<T>(pub(crate) T);
 
@@ -59,6 +63,8 @@ struct State {
     folder: IShellFolder,
     hidden: HashSet<String>,
     watch: Option<(HANDLE, *mut OwnerWatch)>,
+    allowed: Option<usize>,
+    menu: Option<(String, POINT)>,
 }
 
 struct Unload {
@@ -106,7 +112,10 @@ unsafe fn attach() -> Result<()> {
                 WINDOW_EX_STYLE::default(), &class_name, None, WINDOW_STYLE::default(),
                 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(module.into()), None,
             )?;
-            Ok(State { module, def_view, list_view, window, view, folder, hidden: HashSet::new(), watch: None })
+            Ok(State {
+                module, def_view, list_view, window, view, folder,
+                hidden: HashSet::new(), watch: None, allowed: None, menu: None,
+            })
         };
         let state = match setup() {
             Ok(state) => state,
@@ -138,26 +147,55 @@ unsafe fn shell_view() -> Result<(IFolderView2, IShellFolder)> {
     }
 }
 
+fn name_of(state: &State, index: usize) -> Option<String> {
+    unsafe {
+        let pidl = state.view.Item(index as i32).ok()?;
+        let mut strret = STRRET::default();
+        let flags = SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0);
+        let mut name = None;
+        if state.folder.GetDisplayNameOf(pidl, flags, &mut strret).is_ok() {
+            let mut text = PWSTR::null();
+            if StrRetToStrW(&mut strret, Some(pidl), &mut text).is_ok() {
+                name = text.to_string().ok();
+                CoTaskMemFree(Some(text.0 as _));
+            }
+        }
+        CoTaskMemFree(Some(pidl as _));
+        name
+    }
+}
+
 pub(crate) fn is_hidden(index: usize) -> bool {
     let Ok(state) = STATE.0.try_borrow() else { return false };
     let Some(state) = state.as_ref() else { return false };
     if state.hidden.is_empty() {
         return false;
     }
+    name_of(state, index).is_some_and(|name| state.hidden.contains(&name.to_lowercase()))
+}
+
+fn is_allowed(index: usize) -> bool {
+    STATE.0.try_borrow().ok().and_then(|s| s.as_ref().map(|s| s.allowed == Some(index))).unwrap_or(false)
+}
+
+fn hidden_name(index: usize) -> Option<String> {
+    let state = STATE.0.try_borrow().ok()?;
+    let state = state.as_ref()?;
+    let name = name_of(state, index)?;
+    state.hidden.contains(&name.to_lowercase()).then_some(name)
+}
+
+fn notify_owner(event: usize, words: &[u16]) {
     unsafe {
-        let Ok(pidl) = state.view.Item(index as i32) else { return false };
-        let mut strret = STRRET::default();
-        let flags = SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0);
-        let mut hidden = false;
-        if state.folder.GetDisplayNameOf(pidl, flags, &mut strret).is_ok() {
-            let mut text = PWSTR::null();
-            if StrRetToStrW(&mut strret, Some(pidl), &mut text).is_ok() {
-                hidden = text.to_string().is_ok_and(|name| state.hidden.contains(&name.to_lowercase()));
-                CoTaskMemFree(Some(text.0 as _));
-            }
-        }
-        CoTaskMemFree(Some(pidl as _));
-        hidden
+        let Ok(main) = FindWindowW(&HSTRING::from(protocol::MAIN_CLASS), None) else { return };
+        let payload = COPYDATASTRUCT {
+            dwData: event,
+            cbData: (words.len() * 2) as u32,
+            lpData: if words.is_empty() { std::ptr::null_mut() } else { words.as_ptr() as *mut _ },
+        };
+        SendMessageTimeoutW(
+            main, WM_COPYDATA, WPARAM(0), LPARAM(&payload as *const _ as isize), SMTO_ABORTIFHUNG, 1000, None,
+        );
     }
 }
 
@@ -201,10 +239,16 @@ unsafe fn notify(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option
                 let selecting = (change.uChanged.0 & LVIF_STATE.0) != 0
                     && (change.uNewState & LVIS_SELECTED.0) != 0
                     && (change.uOldState & LVIS_SELECTED.0) == 0;
-                if selecting && change.iItem >= 0 && is_hidden(change.iItem as usize) {
+                if selecting && change.iItem >= 0 && !is_allowed(change.iItem as usize) && is_hidden(change.iItem as usize) {
                     return Some(LRESULT(1));
                 }
                 None
+            }
+            LVN_BEGINLABELEDITW => {
+                let info = &*(lparam.0 as *const NMLVDISPINFOW);
+                let name = (info.item.iItem >= 0).then(|| hidden_name(info.item.iItem as usize)).flatten()?;
+                notify_owner(EVT_RENAME, &protocol::encode_names(&[name]));
+                Some(LRESULT(1))
             }
             LVN_ITEMCHANGED => {
                 let change = &*(lparam.0 as *const NMLISTVIEW);
@@ -262,6 +306,10 @@ unsafe extern "system" fn agent_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             _ = catch_unwind(|| unsafe { detach() });
             LRESULT(0)
         }
+        WM_SHOW_MENU => {
+            _ = catch_unwind(|| unsafe { show_menu() });
+            LRESULT(0)
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
@@ -297,9 +345,57 @@ unsafe fn command(data: &COPYDATASTRUCT) {
             }
         }
         CMD_DRAG_END => unsafe { crate::drag::end() },
+        CMD_CONTEXT_MENU => {
+            let Some((x, y)) = protocol::decode_point(words) else { return };
+            let Some(name) = protocol::decode_names(&words[4..]).into_iter().next() else { return };
+            let Ok(mut state) = STATE.0.try_borrow_mut() else { return };
+            let Some(state) = state.as_mut() else { return };
+            state.menu = Some((name, POINT { x, y }));
+            unsafe { _ = PostMessageW(Some(state.window), WM_SHOW_MENU, WPARAM(0), LPARAM(0)) };
+        }
         CMD_DETACH => unsafe { detach() },
         _ => {}
     }
+}
+
+unsafe fn set_state(list_view: HWND, index: usize, state: u32) {
+    let mask = windows::Win32::UI::Controls::LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
+    let item = LVITEMW {
+        stateMask: mask,
+        state: windows::Win32::UI::Controls::LIST_VIEW_ITEM_STATE_FLAGS(state),
+        ..Default::default()
+    };
+    unsafe { SendMessageW(list_view, LVM_SETITEMSTATE, Some(WPARAM(index)), Some(LPARAM(&item as *const _ as isize))) };
+}
+
+unsafe fn show_menu() {
+    let found = {
+        let Ok(mut state) = STATE.0.try_borrow_mut() else { return };
+        let Some(state) = state.as_mut() else { return };
+        let Some((name, point)) = state.menu.take() else { return };
+        let count = unsafe { SendMessageW(state.list_view, LVM_GETITEMCOUNT, None, None).0.max(0) as usize };
+        let index = (0..count).find(|&i| name_of(state, i).is_some_and(|n| n.eq_ignore_ascii_case(&name)));
+        if let Some(index) = index {
+            state.allowed = Some(index);
+        }
+        index.map(|index| (state.list_view, index, point))
+    };
+    let Some((list_view, index, _point)) = found else {
+        notify_owner(EVT_MENU_DONE, &[]);
+        return;
+    };
+    unsafe {
+        set_state(list_view, usize::MAX, 0);
+        set_state(list_view, index, LVIS_SELECTED.0 | LVIS_FOCUSED.0);
+        SendMessageW(list_view, WM_CONTEXTMENU, Some(WPARAM(list_view.0 as usize)), Some(LPARAM(-1)));
+        if let Ok(mut state) = STATE.0.try_borrow_mut() {
+            if let Some(state) = state.as_mut() {
+                state.allowed = None;
+            }
+        }
+        set_state(list_view, index, 0);
+    }
+    notify_owner(EVT_MENU_DONE, &[]);
 }
 
 unsafe fn watch_owner(pid: u32) {
