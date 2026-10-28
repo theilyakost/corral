@@ -51,6 +51,8 @@ const WM_APP_DESKTOP_CHANGED: u32 = WM_APP + 2;
 const WM_APP_PORTAL_CHANGED: u32 = WM_APP + 3;
 const TIMER_LATE_LAYOUT: usize = 8;
 const TIMER_PORTALS: usize = 9;
+const TIMER_ICONS: usize = 10;
+const ICON_RETRY_MS: u32 = 2500;
 const LATE_LAYOUT_MS: u32 = 1500;
 const TIMER_LAYOUT: usize = 1;
 const TIMER_ATTACH: usize = 2;
@@ -360,16 +362,10 @@ pub fn modern_menu(index: usize, name: &str, at: POINT) -> bool {
     true
 }
 
-pub fn rename_file(old: &str, new: &str) {
-    let renamed = DESKTOP.with(|cell| {
-        let desktop = cell.try_borrow().ok()?;
-        let desktop = desktop.as_ref()?;
-        let items = desktop.items().ok()?;
-        let item = items.iter().find(|i| i.name == old)?;
-        Some(desktop.rename(item, new))
-    });
-    match renamed {
-        Some(Ok(file)) => {
+pub fn rename_file(old: &str, item: &IShellItem, new: &str) {
+    match shell::rename(item, new) {
+        Ok((file, fresh)) => {
+            shelf::replace_entry(old, &file, fresh);
             with_app(|app| {
                 for group in &mut app.config.groups {
                     for list in [&mut group.items, &mut group.exclude] {
@@ -380,27 +376,38 @@ pub fn rename_file(old: &str, new: &str) {
                 }
             });
             save_config();
-            schedule(TIMER_LAYOUT, 200);
+            schedule(TIMER_LAYOUT, 0);
         }
-        Some(Err(e)) => show_error(&format!("Не удалось переименовать «{old}»:\n{e}")),
-        None => {}
+        Err(e) => show_error(&format!("Не удалось переименовать «{old}»:\n{e}")),
+    }
+}
+
+pub fn start_entry_rename(entry: Option<(HWND, usize)>, name: &str, item: &IShellItem, at: POINT) {
+    let editing = shell::editing_name(item);
+    let Some(editing) = editing else { return };
+    let target = rename::Target::File(name.to_string(), item.clone());
+    match entry.and_then(|(body, index)| shelf::label_rect(body, index)) {
+        Some((rect, scale)) => rename::start_for(target, rect, &editing, rename::Look::Label(scale)),
+        None => {
+            let rect = windows::Win32::Foundation::RECT { left: at.x - 45, top: at.y, right: at.x + 45, bottom: at.y + 40 };
+            rename::start_for(target, rect, &editing, rename::Look::Label(1.0));
+        }
     }
 }
 
 fn rename_request(name: &str) {
-    let editing = DESKTOP.with(|cell| {
+    let item = DESKTOP.with(|cell| {
         let desktop = cell.try_borrow().ok()?;
         let desktop = desktop.as_ref()?;
         let items = desktop.items().ok()?;
-        desktop.editing_name(items.iter().find(|i| i.name == name)?).ok()
+        desktop.shell_item(items.iter().find(|i| i.name == name)?).ok()
     });
-    let Some(editing) = editing else { return };
+    let Some(item) = item else { return };
     let mut at = with_app(|app| app.menu_point).flatten().unwrap_or_default();
     if at == POINT::default() {
         unsafe { _ = GetCursorPos(&mut at) };
     }
-    let rect = windows::Win32::Foundation::RECT { left: at.x - 90, top: at.y + 18, right: at.x + 90, bottom: at.y + 44 };
-    rename::start_for(rename::Target::File(name.to_string()), rect, &editing);
+    start_entry_rename(shelf::locate(name), name, &item, at);
 }
 
 fn agent_event(data: &windows::Win32::System::DataExchange::COPYDATASTRUCT) {
@@ -663,6 +670,7 @@ fn refresh_portals() {
     for (body, path) in portals {
         shelf::set_items(body, portal::items(&path));
     }
+    schedule(TIMER_ICONS, ICON_RETRY_MS);
 }
 
 pub fn portal_path(index: usize) -> Option<String> {
@@ -756,7 +764,8 @@ fn arrange(desktop: &Desktop, groups: &[Group], owned: bool) -> windows::core::R
         shelf::set_spacing(grid.spacing);
         for item in &items {
             let Some(list) = config::group_of(groups, &item.name).and_then(|g| members.get_mut(g)) else { continue };
-            if let Ok(shell_item) = desktop.shell_item(item) {
+            let local = dirs.iter().map(|d| d.join(&item.name)).find(|p| p.exists()).and_then(|p| shell::item_at(&p));
+            if let Some(shell_item) = local.or_else(|| desktop.shell_item(item).ok()) {
                 list.push((item.name.clone(), shell_item));
             }
         }
@@ -784,6 +793,7 @@ fn show_members(members: Vec<Vec<(String, IShellItem)>>, owned: bool) {
         with_app(|app| app.agent = Some(agent));
     }
     let mut members = members;
+    schedule(TIMER_ICONS, ICON_RETRY_MS);
     for (index, body, portal) in bodies {
         match portal {
             Some(path) => shelf::set_items(body, portal::items(&path)),
@@ -1120,7 +1130,7 @@ fn step_animations() {
 fn check_peek() {
     let mut cursor = POINT::default();
     unsafe { _ = GetCursorPos(&mut cursor) };
-    let busy = shell::menu_open();
+    let busy = shell::menu_open() || rename::is_active();
     let closed = with_app(|app| {
         let index = app.peek?;
         let group = app.config.groups.get(index)?;
@@ -1257,6 +1267,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     TIMER_DRAG_PREVIEW => drag_preview(),
                     TIMER_LATE_LAYOUT => layout_icons(),
                     TIMER_PORTALS => refresh_portals(),
+                    TIMER_ICONS => shelf::retry_icons(),
                     TIMER_RENAME => {
                         if let Some(Some(name)) = with_app(|app| app.pending_rename.take()) {
                             rename_request(&name);

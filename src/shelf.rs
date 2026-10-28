@@ -35,7 +35,7 @@ use windows::Win32::UI::Shell::IShellItem;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTTRANSPARENT, MA_NOACTIVATE, WM_DESTROY,
     WM_ERASEBKGND, WM_NCHITTEST, WM_DRAWITEM, WM_INITMENUPOPUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM,
-    WM_MENUCHAR, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP,
+    WM_MENUCHAR, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 use windows::core::{Result, w};
 
@@ -92,6 +92,7 @@ pub struct Entry {
     item: IShellItem,
     icon: Option<(i32, Option<IWICBitmap>)>,
     bitmap: Option<(u64, ID2D1Bitmap)>,
+    retried: bool,
 }
 
 pub struct Frame {
@@ -231,7 +232,7 @@ pub fn set_items(hwnd: HWND, items: Vec<(String, IShellItem)>) {
         .into_iter()
         .map(|(name, item)| {
             let label = if known.contains(&name) { Vec::new() } else { shell::label(&item).encode_utf16().collect() };
-            Entry { name, label, item, icon: None, bitmap: None }
+            Entry { name, label, item, icon: None, bitmap: None, retried: false }
         })
         .collect();
     with_shelf(hwnd, |shelf| {
@@ -624,6 +625,63 @@ fn set_state(hwnd: HWND, f: impl FnOnce(&mut Shelf) -> bool) {
     }
 }
 
+pub fn retry_icons() {
+    let bodies: Vec<HWND> = SHELVES.with(|cell| {
+        let Ok(mut shelves) = cell.try_borrow_mut() else { return Vec::new() };
+        shelves
+            .iter_mut()
+            .filter_map(|(body, shelf)| {
+                let mut changed = false;
+                for entry in shelf.entries.iter_mut().filter(|e| e.icon.is_some() && !e.retried) {
+                    entry.icon = None;
+                    entry.bitmap = None;
+                    entry.retried = true;
+                    changed = true;
+                }
+                changed.then_some(HWND(*body as _))
+            })
+            .collect()
+    });
+    for body in bodies {
+        render(body);
+    }
+}
+
+pub fn replace_entry(old: &str, name: &str, item: IShellItem) {
+    let label: Vec<u16> = shell::label(&item).encode_utf16().collect();
+    let Some(body) = locate(old).map(|(body, _)| body) else { return };
+    with_shelf(body, |shelf| {
+        if let Some(entry) = shelf.entries.iter_mut().find(|e| e.name.eq_ignore_ascii_case(old)) {
+            *entry = Entry { name: name.to_string(), label, item, icon: None, bitmap: None, retried: false };
+        }
+    });
+    render(body);
+}
+
+pub fn locate(name: &str) -> Option<(HWND, usize)> {
+    SHELVES.with(|cell| {
+        let shelves = cell.try_borrow().ok()?;
+        shelves.iter().find_map(|(body, shelf)| {
+            let index = shelf.entries.iter().position(|e| e.name.eq_ignore_ascii_case(name))?;
+            Some((HWND(*body as _), index))
+        })
+    })
+}
+
+pub fn label_rect(body: HWND, index: usize) -> Option<(RECT, f32)> {
+    let metrics = metrics(body, client_size(body).0 as f32);
+    let scroll = with_shelf(body, |shelf| shelf.scroll)?;
+    let cell = metrics.cell(index, scroll);
+    let s = metrics.scale;
+    let top = cell.top + ICON_TOP * s + metrics.icon_pixels() as f32 + LABEL_GAP * s - 2.0 * s;
+    let line = FONT_SIZE * s * 1.34;
+    let mut origin = POINT { x: (cell.left - 4.0 * s).round() as i32, y: top.round() as i32 };
+    unsafe { _ = ClientToScreen(body, &mut origin) };
+    let width = (cell.right - cell.left + 8.0 * s).round() as i32;
+    let height = (line * LABEL_LINES + 6.0 * s).round() as i32;
+    Some((RECT { left: origin.x, top: origin.y, right: origin.x + width, bottom: origin.y + height }, s))
+}
+
 fn entry(hwnd: HWND, index: usize) -> Option<(String, IShellItem)> {
     with_shelf(hwnd, |shelf| shelf.entries.get(index).map(|e| (e.name.clone(), e.item.clone()))).flatten()
 }
@@ -632,6 +690,9 @@ pub unsafe extern "system" fn shelf_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
     unsafe {
         if let Some(result) = crate::group::grip_message(hwnd, msg, wparam, lparam) {
             return result;
+        }
+        if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_LBUTTONDBLCLK) && crate::rename::is_active() {
+            crate::rename::finish(true);
         }
         if matches!(msg, WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR) {
             if let Some(result) = shell::forward_menu_message(msg, wparam, lparam) {
@@ -697,8 +758,10 @@ pub unsafe extern "system" fn shelf_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                     return LRESULT(0);
                 }
                 let extra = (!crate::is_portal(group)).then_some("Убрать из группы");
-                if let Some(MenuChoice::Extra) = shell::context_menu(hwnd, &item, extra, at) {
-                    crate::take_out(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as usize, &name);
+                match shell::context_menu(hwnd, &item, extra, at) {
+                    Some(MenuChoice::Extra) => crate::take_out(group, &name),
+                    Some(MenuChoice::Rename) => crate::start_entry_rename(Some((hwnd, index)), &name, &item, at),
+                    _ => {}
                 }
                 LRESULT(0)
             }

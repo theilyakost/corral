@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MA_NOACTIVATE, RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, SetLayeredWindowAttributes,
     IsWindowVisible, SetWindowTextW, ShowWindow,
     LWA_COLORKEY, SetWindowLongPtrW, SetWindowPos, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_LBUTTONDBLCLK, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_CHILD,
+    WM_LBUTTONDBLCLK, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_CHILD,
     WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT, WS_VISIBLE,
 };
 use windows::core::{HSTRING, Result, w};
@@ -350,6 +350,9 @@ impl GroupWindows {
 
 unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN) && crate::rename::is_active() {
+            crate::rename::finish(true);
+        }
         match msg {
             WM_PAINT => {
                 paint(hwnd, current_style().header, true, Edges::All);

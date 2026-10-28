@@ -8,7 +8,7 @@ use windows::Win32::UI::Shell::Common::{ITEMIDLIST, STRRET};
 use windows::Win32::UI::Shell::{
     CSIDL_DESKTOP, FWF_AUTOARRANGE, IFolderView2, IShellBrowser, IShellFolder, IShellItem, IShellWindows,
     SHCreateItemWithParent, SHGDN_FORPARSING,
-    SHGDN_FOREDITING, SHGDN_INFOLDER, SHGDNF, SID_STopLevelBrowser, SVGIO_ALLVIEW, SVSI_POSITIONITEM, SWC_DESKTOP,
+    SHGDN_INFOLDER, SHGDNF, SID_STopLevelBrowser, SVGIO_ALLVIEW, SVSI_POSITIONITEM, SWC_DESKTOP,
     SWFO_NEEDDISPATCH, ShellWindows, StrRetToStrW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetParent};
@@ -95,23 +95,6 @@ impl Desktop {
             }
         }
         Ok(items)
-    }
-
-    pub fn editing_name(&self, item: &DesktopItem) -> Result<String> {
-        self.name_with(item.pidl, SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FOREDITING.0))
-    }
-
-    pub fn rename(&self, item: &DesktopItem, name: &str) -> Result<String> {
-        unsafe {
-            let mut renamed: *mut ITEMIDLIST = std::ptr::null_mut();
-            self.folder.SetNameOf(
-                None, item.pidl, &windows::core::HSTRING::from(name), SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FOREDITING.0),
-                Some(&mut renamed),
-            )?;
-            let result = self.display_name(renamed);
-            CoTaskMemFree(Some(renamed as _));
-            result
-        }
     }
 
     fn display_name(&self, pidl: *const ITEMIDLIST) -> Result<String> {
