@@ -132,6 +132,3 @@ fn staging_copy(source: &PathBuf) -> Option<PathBuf> {
     Some(copy)
 }
 
-pub fn disabled_flag() -> PathBuf {
-    crate::config::Config::path().with_file_name("agent.disabled")
-}

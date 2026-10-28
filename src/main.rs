@@ -87,6 +87,7 @@ struct App {
     drag: Option<Drag>,
     retries: u32,
     agent: Option<Agent>,
+    agent_suspended: bool,
     grid: Option<Grid>,
     menu_point: Option<POINT>,
     pending_rename: Option<String>,
@@ -192,6 +193,7 @@ fn main() {
             Err(e) => return show_error(&format!("Не удалось прочитать конфиг:\n{e}")),
         };
         group::set_style(&config.appearance);
+        _ = std::fs::remove_file(Config::path().with_file_name("agent.disabled"));
 
         let instance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
         group::register_classes(instance);
@@ -213,7 +215,7 @@ fn main() {
         };
 
         APP.with(|cell| {
-            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0, agent: None, grid: None, menu_point: None, pending_rename: None, peek: None, animations: Vec::new() });
+            *cell.borrow_mut() = Some(App { main, instance, config, windows: Vec::new(), drag: None, retries: 0, agent: None, agent_suspended: false, grid: None, menu_point: None, pending_rename: None, peek: None, animations: Vec::new() });
         });
         add_tray_icon(main);
         watcher::watch_desktop(main, WM_APP_DESKTOP_CHANGED);
@@ -266,7 +268,7 @@ fn fit_groups() {
 }
 
 fn connect_agent(list_view: HWND) {
-    if agent::disabled_flag().exists() || with_app(|app| app.agent.is_some()) != Some(false) {
+    if with_app(|app| app.agent.is_some() || app.agent_suspended) != Some(false) {
         return;
     }
     let agent = Agent::inject(list_view).ok();
@@ -589,13 +591,7 @@ pub fn set_appearance(appearance: Appearance) {
 }
 
 pub fn agent_enabled() -> bool {
-    !agent::disabled_flag().exists()
-}
-
-pub fn set_agent(enabled: bool) {
-    if enabled != agent_enabled() {
-        toggle_agent();
-    }
+    with_app(|app| app.agent.is_some()).unwrap_or(false)
 }
 
 pub fn set_autostart(enabled: bool) {
@@ -603,23 +599,6 @@ pub fn set_autostart(enabled: bool) {
         if let Some(main) = with_app(|app| app.main) {
             toggle_autostart(main);
         }
-    }
-}
-
-fn toggle_agent() {
-    let flag = agent::disabled_flag();
-    if flag.exists() {
-        _ = std::fs::remove_file(&flag);
-        if let Some((_, _, list_view)) = handles() {
-            connect_agent(list_view);
-        }
-    } else {
-        _ = std::fs::write(&flag, "");
-        with_app(|app| app.agent = None);
-    }
-    if let Some((host, def_view, _)) = handles() {
-        rebuild_windows(host, def_view);
-        layout_icons();
     }
 }
 
@@ -1312,12 +1291,15 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 add_tray_icon(hwnd);
                 detach();
                 SetTimer(Some(hwnd), TIMER_ATTACH, 1500, None);
-                let crashed = with_app(|app| app.agent.take().is_some_and(|a| a.started.elapsed() < AGENT_GRACE));
+                let crashed = with_app(|app| {
+                    let crashed = app.agent.take().is_some_and(|a| a.started.elapsed() < AGENT_GRACE);
+                    app.agent_suspended |= crashed;
+                    crashed
+                });
                 if crashed == Some(true) {
-                    _ = std::fs::write(agent::disabled_flag(), "");
                     MessageBoxW(
                         None,
-                        w!("Проводник перезапустился вскоре после подключения агента, поэтому агент отключён.\n\nИконки групп снова видны. Включить агент: меню в трее → «Прятать иконки в группах»."),
+                        w!("Проводник перезапустился сразу после подключения агента, поэтому до перезапуска Corral иконки в группах не прячутся.\n\nПерезапустите Corral, когда Проводник придёт в себя."),
                         w!("Corral"),
                         MB_ICONWARNING,
                     );

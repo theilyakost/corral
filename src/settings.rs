@@ -42,7 +42,6 @@ const ID_HEADER_OPACITY: i32 = 116;
 const ID_BODY_OPACITY: i32 = 117;
 const ID_ANIMATE: i32 = 118;
 const ID_HOVER: i32 = 119;
-const ID_AGENT: i32 = 120;
 const ID_AUTOSTART: i32 = 121;
 const ID_BORDER_COLOR: i32 = 122;
 const ID_BORDER_SWATCH: i32 = 123;
@@ -67,7 +66,7 @@ const TBM_GETPOS: u32 = 0x0400;
 const TIMER_RULES: usize = 1;
 const RULES_DELAY_MS: u32 = 600;
 const WIDTH: i32 = 680;
-const HEIGHT: i32 = 644;
+const HEIGHT: i32 = 616;
 const GROUP_FIELDS: [i32; 4] = [ID_REMOVE, ID_NAME, ID_RULES, ID_COLLAPSED];
 
 struct Settings {
@@ -199,9 +198,8 @@ pub fn open(instance: HINSTANCE) {
         add(w!("BUTTON"), "Раскрывать плашки при наведении", check, none, ID_HOVER, [252, 468, 300, 22]);
         add(w!("BUTTON"), "Скруглённые углы", check, none, ID_ROUNDED, [252, 496, 300, 22]);
 
-        add(w!("BUTTON"), "Прятать иконки в группах (агент в Проводнике)", check, none, ID_AGENT, [236, 548, 428, 22]);
-        add(w!("BUTTON"), "Запускать при входе в Windows", check, none, ID_AUTOSTART, [236, 576, 428, 22]);
-        add(w!("BUTTON"), "Новое контекстное меню Windows 11 (эксперимент)", check, none, ID_MODERN_MENU, [236, 604, 428, 22]);
+        add(w!("BUTTON"), "Запускать при входе в Windows", check, none, ID_AUTOSTART, [236, 548, 428, 22]);
+        add(w!("BUTTON"), "Новое контекстное меню Windows 11 (эксперимент)", check, none, ID_MODERN_MENU, [236, 576, 428, 22]);
 
         if let Ok(themes) = GetDlgItem(Some(hwnd), ID_THEME) {
             let names = crate::themes::THEMES.iter().map(|t| t.name).chain([CUSTOM_THEME]);
@@ -300,7 +298,6 @@ pub fn refresh() {
     with_settings(|s| s.selected = selected);
     load_group(hwnd, selected);
     load_appearance(hwnd, &config.appearance);
-    set_check(hwnd, ID_AGENT, crate::agent_enabled());
     set_check(hwnd, ID_AUTOSTART, crate::autostart::enabled());
     set_check(hwnd, ID_MODERN_MENU, config.modern_menu);
     with_settings(|s| s.loading = false);
@@ -494,10 +491,6 @@ fn command(hwnd: HWND, id: i32, code: u32) {
         (ID_ROUNDED, BN_CLICKED) => {
             let on = checked(hwnd, ID_ROUNDED);
             change_appearance(hwnd, |a| a.rounded = on);
-        }
-        (ID_AGENT, BN_CLICKED) => {
-            crate::set_agent(checked(hwnd, ID_AGENT));
-            refresh();
         }
         (ID_MODERN_MENU, BN_CLICKED) => crate::set_modern_menu(checked(hwnd, ID_MODERN_MENU)),
         (ID_AUTOSTART, BN_CLICKED) => {
