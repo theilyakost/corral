@@ -363,6 +363,9 @@ pub fn modern_menu(index: usize, name: &str, at: POINT) -> bool {
 }
 
 pub fn rename_file(old: &str, item: &IShellItem, new: &str) {
+    if let Some(target) = shell::target_name(item, new) {
+        with_app(|app| app.agent.as_mut().map(|agent| agent.hide_also(&target)));
+    }
     match shell::rename(item, new) {
         Ok((file, fresh)) => {
             shelf::replace_entry(old, &file, fresh);

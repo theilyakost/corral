@@ -70,6 +70,14 @@ impl Agent {
         unsafe { IsWindow(Some(self.window)).as_bool() }
     }
 
+    pub fn hide_also(&mut self, name: &str) {
+        let mut names = self.hidden.clone();
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+            self.set_hidden(names);
+        }
+    }
+
     pub fn set_hidden(&mut self, mut names: Vec<String>) {
         names.sort();
         if names != self.hidden {

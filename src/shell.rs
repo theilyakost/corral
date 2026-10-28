@@ -8,9 +8,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICImagingFactory,
 };
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+use windows::Win32::System::Com::{CLSCTX_ALL, CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::{
-    BHID_SFUIObject, CMF_CANRENAME, CMF_NORMAL, GCS_VERBA, GCS_VERBW, IShellFolder, SHBindToParent, SHCreateItemWithParent,
+    FOF_ALLOWUNDO, FOFX_EARLYFAILURE, FileOperation, IFileOperation, SIGDN_FILESYSPATH, BHID_SFUIObject, CMF_CANRENAME, CMF_NORMAL, GCS_VERBA, GCS_VERBW, IShellFolder, SHBindToParent, SHCreateItemWithParent,
     SHGDN_FOREDITING,
     SHGDN_FORPARSING, SHGDN_INFOLDER, SHGDNF, StrRetToStrW, CMIC_MASK_PTINVOKE, CMINVOKECOMMANDINFOEX, IContextMenu,
     IContextMenu2, IContextMenu3, IShellItem, IShellItemImageFactory, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW,
@@ -216,7 +216,67 @@ pub fn editing_name(item: &IShellItem) -> Option<String> {
     with_parent(item, |folder, child| name_of(folder, child, SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FOREDITING.0))).flatten()
 }
 
+pub fn full_name(parsing: &str, editing: &str, new: &str) -> String {
+    let hidden = match parsing.strip_prefix(editing) {
+        Some(rest) if !rest.is_empty() && rest.starts_with('.') => rest,
+        _ => "",
+    };
+    if hidden.is_empty() || new.to_lowercase().ends_with(&hidden.to_lowercase()) {
+        new.to_string()
+    } else {
+        format!("{new}{hidden}")
+    }
+}
+
+fn rename_with_operation(item: &IShellItem, full: &str) -> Result<(String, IShellItem)> {
+    unsafe {
+        let operation: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
+        operation.SetOperationFlags(FOF_ALLOWUNDO | FOFX_EARLYFAILURE)?;
+        operation.RenameItem(item, &HSTRING::from(full), None)?;
+        operation.PerformOperations()?;
+        if operation.GetAnyOperationsAborted()?.as_bool() {
+            return Err(windows::core::Error::empty());
+        }
+        let parent = item.GetParent()?;
+        let folder = parent.GetDisplayName(SIGDN_FILESYSPATH)?;
+        let path = std::path::Path::new(&folder.to_string().unwrap_or_default()).join(full);
+        CoTaskMemFree(Some(folder.0 as _));
+        let fresh = item_at(&path).ok_or_else(windows::core::Error::empty)?;
+        Ok((full.to_string(), fresh))
+    }
+}
+
+pub fn target_name(item: &IShellItem, name: &str) -> Option<String> {
+    let (parsing, editing) = with_parent(item, |folder, child| {
+        (
+            name_of(folder, child, SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0)),
+            name_of(folder, child, SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FOREDITING.0)),
+        )
+    })?;
+    Some(full_name(&parsing?, &editing?, name))
+}
+
 pub fn rename(item: &IShellItem, name: &str) -> Result<(String, IShellItem)> {
+    let names = with_parent(item, |folder, child| {
+        (
+            name_of(folder, child, SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0)),
+            name_of(folder, child, SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FOREDITING.0)),
+        )
+    });
+    let (parsing, editing) = match names {
+        Some((Some(parsing), Some(editing))) => (parsing, editing),
+        _ => return Err(windows::core::Error::empty()),
+    };
+    if editing == name {
+        return Ok((parsing, item.clone()));
+    }
+    match rename_in_folder(item, name) {
+        Ok(renamed) => Ok(renamed),
+        Err(first) => rename_with_operation(item, &full_name(&parsing, &editing, name)).map_err(|_| first),
+    }
+}
+
+fn rename_in_folder(item: &IShellItem, name: &str) -> Result<(String, IShellItem)> {
     with_parent(item, |folder, child| unsafe {
         let mut renamed: *mut ITEMIDLIST = std::ptr::null_mut();
         folder.SetNameOf(None, child, &HSTRING::from(name), SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FOREDITING.0), Some(&mut renamed))?;
@@ -295,6 +355,15 @@ pub fn forward_menu_message(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_extensions_are_kept() {
+        assert_eq!(full_name("report.pdf", "report", "summary"), "summary.pdf");
+        assert_eq!(full_name("report.pdf", "report", "summary.pdf"), "summary.pdf");
+        assert_eq!(full_name("report.pdf", "report.pdf", "summary.txt"), "summary.txt");
+        assert_eq!(full_name("Mucic", "Mucic", "Music"), "Music");
+        assert_eq!(full_name("v1.2", "v1.2", "v1.3"), "v1.3");
+    }
 
     #[test]
     fn only_pictures_and_video_get_previews() {
